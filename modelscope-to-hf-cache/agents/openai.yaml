@@ -1,0 +1,4 @@
+interface:
+  display_name: "ModelScope to HF Cache"
+  short_description: "Download ModelScope models into Hugging Face cache"
+  default_prompt: "Use $modelscope-to-hf-cache to download a ModelScope model into the Hugging Face cache layout."

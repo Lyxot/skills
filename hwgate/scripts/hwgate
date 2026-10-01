@@ -1,0 +1,1174 @@
+#!/usr/bin/env python3
+"""hwgate: machine-wide admission control for heavy GPU and CPU work.
+
+Every agent on this machine runs Metal/GPU work and heavy CPU work through
+`hwgate run`, so jobs from different agents take turns instead of fighting
+over the GPU, cores, and heat.
+
+Slot policy, decided by the macOS thermal state when a job asks to start:
+  nominal   up to SLOT_PARALLEL jobs per slot, while their declared cores fit
+            the budget
+  fair      only one heavy job at all: a new job takes every slot
+  serious+  nothing new starts; after it clears, wait HWGATE_COOLDOWN seconds
+Running jobs are not stopped for heat: finishing costs less than restarting.
+
+Jobs share a slot: up to SLOT_PARALLEL of them hold one at a time, because work
+that is not being timed loses little to running alongside other work. --stable is
+what asks for the machine alone, and heat does the same thing for every job. A
+job waiting for a whole slot raises a barrier, so overlapping sharers cannot
+starve it. A job admitted onto a slot that others already hold is told which
+ones, because sharing is the one admission outcome that changes how the job runs
+without making it wait, and nothing else in its output would reveal it.
+
+--cpus declares a core count. A job that names one is charged it instead of a
+share of the pool, so honest declarations fit more work on the machine; a job
+that names none is charged its share. macOS has no cgroups, so a declaration is
+accounting plus the environment the job is handed, never a cage.
+HWGATE_CPU_BUDGET overrides the total, which defaults to the performance cores.
+
+Memory is deliberately not gated. On this machine the binding limit is the GPU's
+wired working set, which cannot be compressed or swapped and is smaller than
+physical memory, so a budget derived from physical memory admits GPU jobs into a
+hard allocation failure rather than into running slower. A number the gate cannot
+enforce and cannot derive correctly is worse than no number, so there is none.
+
+Stable-performance jobs (--stable: benchmarks, timing or throughput runs):
+  - start only at nominal, after HWGATE_COOLDOWN seconds without any reading
+    of fair or worse, and take every slot so nothing else competes;
+  - are killed with exit 76 once they are throttled: the thermal state is
+    above nominal AND a watched unit (the GPU for --needs gpu, the P-cores
+    for --needs cpu) runs, while busy, more than 10% below its own median
+    frequency from the nominal part of the run, continuously for longer than
+    --throttle-budget seconds. Heat without a frequency drop, or a frequency
+    drop at nominal, does not abort. The next --stable run waits out a fresh
+    cooldown before it starts.
+  - print a summary of the frequencies and thermal peak they saw on exit.
+  Frequencies come from IOReport DVFS residency (no sudo). If they cannot be
+  read, throttling means the thermal state alone stays above nominal.
+
+Self-healing:
+  - Slots and budget leases are flock()s held by the job itself, so the kernel
+    frees them when the job dies, however it dies. A crash can never leave a
+    slot taken or a budget spent.
+  - Each job runs in its own process group with a wall-clock --timeout. On
+    timeout, or when the job exits, the whole group is killed, so stray
+    workers (pytest-xdist, mlx.launch ranks) cannot keep the GPU busy.
+  - If the wrapper itself is killed and its job runs past the deadline, the
+    next hwgate that finds the slot taken kills that job's process group.
+  - A job started under hwgate that calls hwgate again reuses the slots it
+    already holds (HWGATE_HELD), so nesting cannot deadlock.
+
+Usage:
+  hwgate run --needs gpu -- python -m pytest tests/test_x_metal.py -q
+  hwgate run --needs cpu --max-wait 300 -- python -m pytest -n auto tests/
+  hwgate run --needs cpu --cpus 4 -- python -m pytest -n 4 tests/
+  hwgate run --needs gpu -- python infer.py
+  hwgate run --needs gpu,cpu --timeout 0 -- python train.py
+  hwgate run --needs gpu --stable --max-wait 600 -- python bench.py
+  hwgate status
+
+Exit codes: the job's own code; 124 on timeout; 75 when --max-wait ran out
+before the job could start; 76 when a --stable job was aborted for
+throttling; 2 on bad usage or a request larger than the machine's budget.
+"""
+
+import argparse
+import contextlib
+import ctypes
+import ctypes.util
+import errno
+import fcntl
+import json
+import os
+import plistlib
+import queue
+import re
+import signal
+import statistics
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+SLOTS = ("gpu", "cpu")
+NOMINAL, FAIR, SERIOUS = 0, 1, 2
+THERMAL_NAMES = {0: "nominal", 1: "fair", 2: "serious", 3: "critical"}
+EXIT_TIMEOUT = 124
+EXIT_GAVE_UP = 75
+EXIT_UNSTABLE = 76
+EXIT_USAGE = 2
+DEFAULT_TIMEOUT = 7200
+KILL_GRACE = 10.0
+HELD_ENV = "HWGATE_HELD"
+HELD_CPUS_ENV = "HWGATE_HELD_CPUS"
+STATE_DIR = os.path.expanduser(os.environ.get("HWGATE_STATE_DIR", "~/.local/state/hwgate"))
+COOLDOWN = float(os.environ.get("HWGATE_COOLDOWN", "60"))
+DEFAULT_THROTTLE_BUDGET = 10.0
+ADMIT_WAIT = 10.0
+# Jobs share a slot. This is how many may hold one at once; --stable takes it alone.
+SLOT_PARALLEL = 3
+# Thread-pool knobs a declared core count answers. A value the caller chose is
+# left alone; one an enclosing gated job was given is replaced, since it sizes
+# the pool to the wrong claim.
+THREAD_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "RAYON_NUM_THREADS",
+)
+BUSY = 0.5
+FREQ_DROP = 0.10
+# Per slot: IOReport group, subgroup, channel-name prefix, pmgr DVFS table key.
+FREQ_SOURCES = {
+    "gpu": ("GPU Stats", "GPU Performance States", "GPUPH", "voltage-states9"),
+    "cpu": ("CPU Stats", "CPU Core Performance States", "PCPU", "voltage-states5-sram"),
+}
+IDLE_STATES = {"IDLE", "DOWN", "OFF"}
+
+_objc = None
+_BUDGETS = {}
+
+
+# How long a message may wait for whoever reads stderr before hwgate stops logging.
+LOG_WAIT = 0.5
+# Messages logged while the admit lock is held, printed once it is released.
+_deferred = None
+_stderr_gone = False
+_stderr_queue = None
+
+
+def log(message):
+    # Under the admit lock nothing is written at all, not even a bounded write: the
+    # wait would be paid by every hwgate on the machine.
+    if _deferred is not None:
+        _deferred.append(message)
+        return
+    write_stderr("hwgate: {}\n".format(message).encode(errors="replace"))
+
+
+def write_stderr(data):
+    """Write to stderr, waiting at most LOG_WAIT for the reader, and give up for good if it stalls.
+
+    hwgate's messages are only information, but a blocking write would hold whatever
+    hwgate holds at that moment -- a barrier, a seat, the job's own start -- for as
+    long as the reader does not read. No check before the write can bound it, since
+    the job shares this stderr and can fill it in between, so the write happens on a
+    thread that hwgate stops waiting for.
+    """
+    global _stderr_gone, _stderr_queue
+    if _stderr_gone:
+        return
+    if _stderr_queue is None:
+        _stderr_queue = queue.SimpleQueue()
+        threading.Thread(target=_drain_stderr, args=(_stderr_queue,), daemon=True).start()
+    written = threading.Event()
+    _stderr_queue.put((data, written))
+    if not written.wait(LOG_WAIT):
+        _stderr_gone = True
+
+
+def _drain_stderr(pending):
+    global _stderr_gone
+    while True:
+        data, written = pending.get()
+        try:
+            while data:
+                data = data[os.write(2, data):]
+        except OSError:
+            _stderr_gone = True
+        written.set()
+
+
+def sysctl(name):
+    try:
+        result = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=2)
+    except subprocess.TimeoutExpired:
+        return None
+    value = result.stdout.strip()
+    return int(value) if value.isdigit() else None
+
+
+def budget(name, read_override, default):
+    """A machine-wide budget, from its variable or the machine itself.
+
+    An unusable override says what is wrong and stops, rather than reaching the
+    caller as a traceback from wherever the budget is first needed.
+    """
+    if name not in _BUDGETS:
+        override = os.environ.get(name)
+        try:
+            _BUDGETS[name] = read_override(override) if override else default()
+        except (ValueError, argparse.ArgumentTypeError) as e:
+            log("{} is unusable: {}".format("{}={!r}".format(name, override) if override else name, e))
+            sys.exit(EXIT_USAGE)
+    return _BUDGETS[name]
+
+
+def whole_cores(text):
+    if not text.isdigit() or int(text) < 1:
+        raise ValueError("a whole number of cores, at least 1")
+    return int(text)
+
+
+def cpu_budget():
+    """Cores handed out in total; the performance cores, since the others are slower."""
+    return budget("HWGATE_CPU_BUDGET", whole_cores,
+                  lambda: max(1, sysctl("hw.perflevel0.physicalcpu") or os.cpu_count() or 1))
+
+
+def fair_share_cores():
+    """What a job that needs the cpu slot but named no core count is charged.
+
+    Rounded down, or the budget would refuse the last seat the slot offers; at least
+    one, or a budget below SLOT_PARALLEL would let any number of such jobs fit.
+    """
+    return max(1, cpu_budget() // SLOT_PARALLEL)
+
+
+def thermal_state():
+    forced = os.environ.get("HWGATE_FORCE_THERMAL")
+    if forced is not None:
+        # Tests pass a digit, or a file path so the reading can change mid-run.
+        if not forced.isdigit():
+            with open(forced) as f:
+                forced = f.read().strip()
+        return int(forced)
+    global _objc
+    try:
+        if _objc is None:
+            objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+            ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Foundation.framework/Foundation")
+            objc.objc_getClass.restype = ctypes.c_void_p
+            objc.sel_registerName.restype = ctypes.c_void_p
+            send_ptr = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+            send_long = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc))
+            _objc = (objc, send_ptr, send_long)
+        objc, send_ptr, send_long = _objc
+        info = send_ptr(objc.objc_getClass(b"NSProcessInfo"), objc.sel_registerName(b"processInfo"))
+        return int(send_long(info, objc.sel_registerName(b"thermalState")))
+    except Exception:
+        # An unreadable sensor must not admit more work than a readable one.
+        return FAIR
+
+
+def _cooldown_left(marker, hot):
+    path = os.path.join(STATE_DIR, marker)
+    if hot:
+        with open(path, "w") as f:
+            f.write(str(time.time()))
+        return COOLDOWN
+    try:
+        with open(path) as f:
+            last = float(f.read().strip() or 0)
+    except (OSError, ValueError):
+        last = 0.0
+    return max(0.0, last + COOLDOWN - time.time())
+
+
+def read_thermal():
+    """Return (state, cooldown owed after the last serious reading, cooldown owed after the last fair-or-worse one)."""
+    state = thermal_state()
+    return state, _cooldown_left("last_hot", state >= SERIOUS), _cooldown_left("last_warm", state >= FAIR)
+
+
+def dvfs_tables():
+    """MHz per active DVFS state, lowest first, for each slot's unit."""
+    out = subprocess.run(["ioreg", "-r", "-n", "pmgr", "-a", "-d1"], capture_output=True, check=True).stdout
+    props = plistlib.loads(out)[0]
+    tables = {}
+    for slot, (_, _, _, key) in FREQ_SOURCES.items():
+        raw = props.get(key, b"")
+        freqs = [f for (f, _volt) in struct.iter_unpack("<II", raw[: len(raw) // 8 * 8]) if f]
+        # Hz on M1-M3; kHz on later chips.
+        scale = 1e6 if freqs and max(freqs) > 1e8 else 1e3
+        tables[slot] = [f / scale for f in freqs]
+    return tables
+
+
+class FreqSampler:
+    """Busy-weighted MHz and busy fraction of each unit since the previous sample, via IOReport."""
+
+    UTF8 = 0x08000100
+
+    def __init__(self, slots):
+        self.forced = os.environ.get("HWGATE_FORCE_FREQ")
+        if self.forced:
+            return
+        self.tables = dvfs_tables()
+        vp = ctypes.c_void_p
+        cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        ior = ctypes.cdll.LoadLibrary("/usr/lib/libIOReport.dylib")
+        for fn, res, args in (
+            (cf.CFStringCreateWithCString, vp, [vp, ctypes.c_char_p, ctypes.c_uint32]),
+            (cf.CFStringGetCString, ctypes.c_bool, [vp, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]),
+            (cf.CFDictionaryGetValue, vp, [vp, vp]),
+            (cf.CFDictionaryCreateMutableCopy, vp, [vp, ctypes.c_long, vp]),
+            (cf.CFArrayGetCount, ctypes.c_long, [vp]),
+            (cf.CFArrayGetValueAtIndex, vp, [vp, ctypes.c_long]),
+            (cf.CFRelease, None, [vp]),
+            (ior.IOReportCopyChannelsInGroup, vp, [vp, vp, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]),
+            (ior.IOReportMergeChannels, None, [vp, vp, vp]),
+            (ior.IOReportCreateSubscription, vp, [vp, vp, ctypes.POINTER(vp), ctypes.c_uint64, vp]),
+            (ior.IOReportCreateSamples, vp, [vp, vp, vp]),
+            (ior.IOReportCreateSamplesDelta, vp, [vp, vp, vp]),
+            (ior.IOReportChannelGetChannelName, vp, [vp]),
+            (ior.IOReportStateGetCount, ctypes.c_int32, [vp]),
+            (ior.IOReportStateGetNameForIndex, vp, [vp, ctypes.c_int32]),
+            (ior.IOReportStateGetResidency, ctypes.c_int64, [vp, ctypes.c_int32]),
+        ):
+            fn.restype, fn.argtypes = res, args
+        self.cf, self.ior = cf, ior
+        self.prefixes = {FREQ_SOURCES[s][2]: s for s in slots}
+        channels = None
+        for slot in slots:
+            group, subgroup = FREQ_SOURCES[slot][:2]
+            found = ior.IOReportCopyChannelsInGroup(self._cfstr(group), self._cfstr(subgroup), 0, 0, 0)
+            if channels is None:
+                channels = found
+            else:
+                ior.IOReportMergeChannels(channels, found, None)
+        self.channels = cf.CFDictionaryCreateMutableCopy(None, 0, channels)
+        subscribed = vp()
+        self.sub = ior.IOReportCreateSubscription(None, self.channels, ctypes.byref(subscribed), 0, None)
+        if not self.sub:
+            raise OSError("IOReport subscription failed")
+        self.subscribed = subscribed
+        self.key = self._cfstr("IOReportChannels")
+        self.last = ior.IOReportCreateSamples(self.sub, self.subscribed, None)
+
+    def _cfstr(self, text):
+        return self.cf.CFStringCreateWithCString(None, text.encode(), self.UTF8)
+
+    def _pystr(self, ref):
+        buf = ctypes.create_string_buffer(128)
+        return buf.value.decode() if ref and self.cf.CFStringGetCString(ref, buf, 128, self.UTF8) else ""
+
+    def sample(self):
+        """Return {slot: (MHz while busy, busy fraction)}."""
+        if self.forced:
+            # Tests: a JSON file {"gpu": [mhz, busy], ...} they rewrite mid-run.
+            with open(self.forced) as f:
+                return {slot: tuple(v) for slot, v in json.load(f).items()}
+        cf, ior = self.cf, self.ior
+        current = ior.IOReportCreateSamples(self.sub, self.subscribed, None)
+        delta = ior.IOReportCreateSamplesDelta(self.last, current, None)
+        cf.CFRelease(self.last)
+        self.last = current
+        totals = {slot: [0.0, 0.0, 0.0] for slot in self.prefixes.values()}  # weighted MHz, busy, all
+        items = cf.CFDictionaryGetValue(delta, self.key)
+        for i in range(cf.CFArrayGetCount(items) if items else 0):
+            item = cf.CFArrayGetValueAtIndex(items, i)
+            name = self._pystr(ior.IOReportChannelGetChannelName(item))
+            slot = next((s for p, s in self.prefixes.items() if name.startswith(p)), None)
+            if slot is None:
+                continue
+            table, acc, level = self.tables[slot], totals[slot], 0
+            for k in range(ior.IOReportStateGetCount(item)):
+                residency = ior.IOReportStateGetResidency(item, k)
+                acc[2] += residency
+                if self._pystr(ior.IOReportStateGetNameForIndex(item, k)) in IDLE_STATES:
+                    continue
+                # Without a pmgr table, the state index still orders the frequencies.
+                mhz = table[min(level, len(table) - 1)] if table else level + 1
+                acc[0] += residency * mhz
+                acc[1] += residency
+                level += 1
+        cf.CFRelease(delta)
+        return {slot: (w / busy if busy else 0.0, busy / total if total else 0.0) for slot, (w, busy, total) in totals.items()}
+
+
+class ThrottleWatch:
+    """Decides when a --stable job has been throttled for longer than its budget."""
+
+    def __init__(self, slots, budget):
+        self.slots, self.budget = sorted(slots), budget
+        self.nominal_mhz = {s: [] for s in self.slots}
+        self.min_mhz = {}
+        self.peak_state = NOMINAL
+        self.since = None
+        try:
+            self.sampler = FreqSampler(self.slots)
+        except Exception as e:
+            self.sampler = None
+            log("cannot read CPU/GPU frequency ({}); --stable treats any thermal state above nominal as throttling".format(e))
+
+    def check(self, state):
+        """Feed one ~1s observation; return an abort reason once the budget is exceeded."""
+        self.peak_state = max(self.peak_state, state)
+        freqs = {}
+        if self.sampler:
+            try:
+                freqs = self.sampler.sample()
+            except Exception as e:
+                self.sampler = None
+                log("lost CPU/GPU frequency readings ({}); --stable treats any thermal state above nominal as throttling".format(e))
+        slow = []
+        for slot in self.slots:
+            mhz, busy = freqs.get(slot, (0.0, 0.0))
+            # An idle unit clocks down on purpose and says nothing about throttling.
+            if busy < BUSY:
+                continue
+            self.min_mhz[slot] = min(mhz, self.min_mhz.get(slot, mhz))
+            if state == NOMINAL:
+                self.nominal_mhz[slot].append(mhz)
+            elif self.nominal_mhz[slot]:
+                base = statistics.median(self.nominal_mhz[slot])
+                if mhz < base * (1 - FREQ_DROP):
+                    slow.append("{} at {:.0f} MHz vs {:.0f} MHz at nominal".format(slot, mhz, base))
+        throttled = state > NOMINAL and (slow or self.sampler is None)
+        if not throttled:
+            if self.since is not None:
+                log("--stable: throttling cleared after {:.0f}s".format(time.time() - self.since))
+            self.since = None
+            return None
+        what = "thermal {}{}".format(THERMAL_NAMES.get(state, state), "".join(", " + s for s in slow))
+        if self.since is None:
+            self.since = time.time()
+            log("--stable: throttled ({}); aborting if it lasts over {:.0f}s".format(what, self.budget))
+        if time.time() - self.since > self.budget:
+            return "{} for {:.0f}s".format(what, time.time() - self.since)
+        return None
+
+    def summary(self):
+        parts = ["thermal peak {}".format(THERMAL_NAMES.get(self.peak_state, self.peak_state))]
+        for slot in self.slots:
+            if self.nominal_mhz[slot]:
+                parts.append("{} median {:.0f} MHz at nominal, min {:.0f} MHz while busy".format(
+                    slot, statistics.median(self.nominal_mhz[slot]), self.min_mhz[slot]))
+            else:
+                parts.append("{} never busy at nominal".format(slot))
+        return "; ".join(parts)
+
+
+def try_lock(slot, shared=False):
+    fd = os.open(os.path.join(STATE_DIR, slot + ".lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None
+        raise
+    return fd
+
+
+@contextlib.contextmanager
+def admit_lock(timeout=ADMIT_WAIT):
+    """Serialize admission, so two jobs cannot both claim the same free budget.
+
+    Yields False rather than waiting forever: everything taken while it is held
+    is taken without blocking, so a wedged admit lock is a bug, and hiding one
+    would make --max-wait meaningless. Logging is deferred until it is released.
+    """
+    global _deferred
+    fd = os.open(os.path.join(STATE_DIR, "admit.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    deadline = time.time() + timeout
+    locked = False
+    try:
+        while not locked:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError as e:
+                if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    raise
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.05)
+        if locked:
+            _deferred = []
+        yield locked
+    finally:
+        held, _deferred = _deferred or [], None
+        os.close(fd)
+        for message in held:
+            log(message)
+
+
+def new_lease(cpus, slots, shared):
+    """Create this job's reservation, locked, and return (fd, path).
+
+    The name is unique rather than the wrapper's pid: a pid names a job only
+    while it lives, and a lease outlives its wrapper, so reusing a pid would
+    mean overwriting a reservation whose job is still running.
+    """
+    fd, path = tempfile.mkstemp(dir=os.path.join(STATE_DIR, "leases"),
+                                prefix="{}-".format(os.getpid()), suffix=".json")
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # What other jobs read about this one goes in now, not with the rest of the record
+    # once the job starts: the admit lock is released in between, and a seat this
+    # lease does not yet claim would be handed to someone else.
+    write_lease(fd, {"cpus": cpus, "slots": sorted(slots), "shared": sorted(shared),
+                     "started": time.time()})
+    return fd, path
+
+
+def read_lease(path):
+    """One live lease's record; an unreadable one is read as the whole machine.
+
+    The record is rewritten in place once the job has a pid, so a reader can
+    catch it half-written. Counting a torn lease as everything only delays
+    admission by that instant, where trusting it could over-admit.
+    """
+    try:
+        with open(path) as f:
+            lease = json.load(f)
+        lease["cpus"] = max(0, int(lease["cpus"]))
+        # A lease from a version that did not record slots is read as holding every
+        # one, for the same reason an unreadable lease is: only over-counting is safe.
+        # An empty list is not that case: a nested job's extra charge claims no seat.
+        lease["slots"] = list(lease["slots"]) if "slots" in lease else list(SLOTS)
+        lease["shared"] = list(lease.get("shared", lease["slots"]))
+    except (OSError, ValueError, TypeError, KeyError):
+        lease = {"cpus": cpu_budget(), "slots": list(SLOTS), "shared": list(SLOTS),
+                 "cmd": "(unreadable lease)"}
+    lease["path"] = path
+    return lease
+
+
+def slot_occupants(slot, leases):
+    """How many live jobs hold this slot; read_lease guarantees every lease names its."""
+    return sum(1 for lease in leases if slot in lease["slots"])
+
+
+def scan_leases(reap=False):
+    """Every live reservation, dropping the files whose job is gone.
+
+    A lease is flocked by its own job, so one that can be locked is finished.
+    Callers hold the admit lock, so nobody is mid-creation while this runs.
+    """
+    leases = []
+    try:
+        names = sorted(os.listdir(os.path.join(STATE_DIR, "leases")))
+    except OSError:
+        return leases
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(STATE_DIR, "leases", name)
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            continue
+        finished = flock_nb(fd)
+        os.close(fd)
+        if not finished:
+            leases.append(read_lease(path))
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if reap:
+        for lease in leases:
+            reap_abandoned(lease, "job holding a budget lease")
+    return leases
+
+
+def flock_nb(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return False
+        raise
+    return True
+
+
+def info_path(slot):
+    return os.path.join(STATE_DIR, slot + ".json")
+
+
+def read_info(slot):
+    try:
+        with open(info_path(slot)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def process_start(pid):
+    """The process's start time, or None if ps cannot say; bounded, as reaping asks under the admit lock."""
+    try:
+        result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
+                                text=True, timeout=2)
+    except subprocess.TimeoutExpired:
+        return None
+    return result.stdout.strip() or None
+
+
+def describe_holder(info):
+    # A lease is created before its job has a pid, so a reader can catch it with
+    # nothing to name yet; an unreadable lease names itself through its "cmd".
+    if not info.get("child_pid"):
+        return info.get("cmd", "a job that has not started yet")
+    return "pid {} for {:.0f}s: {}".format(
+        info.get("child_pid"), time.time() - info.get("started", time.time()), info.get("cmd", "?")[:80]
+    )
+
+
+def holder_summary(slot, leases):
+    # Leases first: they are written with the seat, while the info file can outlive a
+    # whole-slot job whose wrapper was killed and would name a dead pid. It is still
+    # the only record of a holder from a version that kept no leases.
+    holders = [lease for lease in leases if slot in lease["slots"]]
+    if holders:
+        verb = "shared" if any(slot in lease["shared"] for lease in holders) else "held"
+        return " ({} by {})".format(verb, "; ".join(describe_holder(lease) for lease in holders))
+    info = read_info(slot)
+    return " (held by {})".format(describe_holder(info)) if info else ""
+
+
+def sharing_notice(share, want, leases):
+    """Name who a job is about to share each slot with, or None if it shares with nobody."""
+    lines = []
+    for slot in sorted(share):
+        others = [lease for lease in leases if slot in lease["slots"]]
+        if not others:
+            continue
+        cores = ", {} of {} cores declared".format(
+            sum(lease["cpus"] for lease in leases) + want, cpu_budget()) if slot == "cpu" else ""
+        lines.append("{}: {} of {} seats taken{}, alongside {}".format(
+            slot, len(others) + 1, SLOT_PARALLEL, cores,
+            "; ".join(describe_holder(lease) for lease in others)))
+    if lines:
+        return ("sharing this machine, so the job gets less than all of it and its timings are not"
+                " comparable to a --stable run:\n  " + "\n  ".join(lines))
+    return None
+
+
+def reap_abandoned(info, what):
+    """Kill a job whose wrapper is gone and whose deadline has passed."""
+    if not info or not info.get("deadline") or time.time() < info["deadline"]:
+        return
+    if any(not isinstance(info.get(key), int) for key in ("wrapper_pid", "pgid", "child_pid")):
+        return
+    if pid_alive(info["wrapper_pid"]) or not group_alive(info["pgid"]):
+        return
+    # The pid may have been reused by an unrelated process since the job started, and a
+    # start time ps could not give, now or when the job began, identifies nothing.
+    if pid_alive(info["child_pid"]):
+        start = process_start(info["child_pid"])
+        if start is None or start != info.get("child_start"):
+            return
+    try:
+        os.killpg(info["pgid"], signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return
+    log("reaped abandoned {} past its deadline: pgid {} ({})".format(what, info["pgid"], info.get("cmd", "?")[:80]))
+
+
+def barrier_path(slot):
+    return os.path.join(STATE_DIR, slot + ".barrier")
+
+
+def sync_barriers(barriers, blocking):
+    """Stand in the way of new shared takes on the slot now blocking this job.
+
+    Shared holders can overlap forever, so without this a job that needs a slot
+    whole could wait out the machine's uptime. One invariant keeps it from
+    deadlocking in turn: a job holds a barrier only while a sharer is actually
+    in the way of its whole-slot take, and any other refusal drops every barrier
+    it holds, so a barrier holder is always waiting on a running job rather than
+    on another waiter.
+    """
+    for slot in [s for s in barriers if s not in blocking]:
+        os.close(barriers.pop(slot))
+    for slot in sorted(blocking - set(barriers)):
+        try:
+            fd = os.open(barrier_path(slot), os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as e:
+            log("cannot open the {} barrier ({}); new jobs will not hold back".format(slot, e))
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as e:
+            os.close(fd)
+            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                log("cannot hold the {} barrier ({}); new jobs will not hold back".format(slot, e))
+            continue
+        barriers[slot] = fd
+        # A hint for whoever is turned away; the lock is what holds the barrier up.
+        write_text(fd, "pid {} ({})".format(os.getpid(), " ".join(sys.argv[1:])[:120]))
+        log("waiting for the whole {} slot; new jobs will hold back until it is free".format(slot))
+
+
+def barrier_holder(slot):
+    try:
+        fd = os.open(barrier_path(slot), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return None
+    up = not flock_nb(fd)
+    os.close(fd)
+    if not up:
+        return None
+    try:
+        with open(barrier_path(slot)) as f:
+            return f.read().strip() or "another job"
+    except OSError:
+        return "another job"
+
+
+def inside_gated_job(leases):
+    """Whether this hwgate was started from within a job hwgate already admitted.
+
+    Every job runs in its own process group, and anything it starts stays in
+    that group, so the group is a truthful answer even when the environment was
+    scrubbed. Callers add what the environment claims, for a job that left the group.
+    """
+    return os.getpgrp() in {lease.get("pgid") for lease in leases}
+
+
+def try_admit(requested, want, held, state, stable, barriers):
+    """One attempt. Returns (slot fds, (lease fd, path), shared slots, refusal).
+
+    Every refusal leaves through refuse(), so no path can keep a barrier it is no
+    longer owed.
+    """
+    # Heat and --stable collapse every slot to exclusive, which only works for a job
+    # that acquires; one that inherits its slots never gets here, so --stable refuses
+    # to run inside another job at all.
+    alone = stable or state >= FAIR
+    need = (set(SLOTS) if alone else set(requested)) - held
+    share = set() if alone else set(need)
+
+    def refuse(reason, blocking=frozenset(), fds=()):
+        sync_barriers(barriers, set(blocking))
+        for fd in fds:
+            os.close(fd)
+        return None, None, None, reason
+
+    with admit_lock() as locked:
+        if not locked:
+            return refuse("another hwgate has held the admission lock for over {:.0f}s".format(ADMIT_WAIT))
+        leases = scan_leases(reap=True)
+        used_cpus = sum(lease["cpus"] for lease in leases)
+        # A job taking the cpu slot whole is answered by the lock below, never the budget:
+        # only a lock refusal raises its barrier, and without one sharers declaring cores
+        # could keep it out for as long as they kept arriving.
+        takes_cpu_whole = alone and "cpu" not in held
+        if want and not takes_cpu_whole and used_cpus + want > cpu_budget():
+            return refuse("cpu budget: {} of {} cores declared, this job needs {}{}".format(
+                used_cpus, cpu_budget(), want, holder_summary("cpu", leases)))
+        for slot in sorted(need if not alone else ()):
+            taken = slot_occupants(slot, leases)
+            if taken >= SLOT_PARALLEL:
+                return refuse("{} slot is full: {} of {} jobs{}".format(
+                    slot, taken, SLOT_PARALLEL, holder_summary(slot, leases)))
+        # A nested job never stands behind a barrier: whoever raised it may be
+        # waiting on this job's own parent. The cost is that a parent starting
+        # sharers back to back can keep a waiter out for as long as it runs.
+        nested = bool(held) or inside_gated_job(leases)
+        for slot in sorted(share if not nested else ()):
+            holder = barrier_holder(slot)
+            if holder:
+                return refuse("{} is waiting for the whole {} slot and goes first".format(holder, slot))
+        fds = {}
+        # Take slots all-or-nothing, never holding one while waiting for another.
+        for slot in [s for s in SLOTS if s in need]:
+            fd = try_lock(slot, shared=slot in share)
+            if fd is None:
+                reap_abandoned(read_info(slot), slot + " job")
+                reason = "{} slot busy{}".format(slot, holder_summary(slot, leases))
+                if stable:
+                    reason += "; --stable runs alone"
+                elif alone:
+                    reason += "; thermal is fair, so one heavy job at a time"
+                sharers = {slot} if slot not in share and any(
+                    slot in l["shared"] for l in leases) else set()
+                return refuse(reason, sharers, fds.values())
+            fds[slot] = fd
+        sync_barriers(barriers, set())
+        notice = sharing_notice(share, want, leases)
+        if notice:
+            log(notice)
+        lease_fd, lease = new_lease(want, fds, share)
+        return fds, (lease_fd, lease), share, None
+
+
+def too_hot_to_start(state, cooldown, warm_cooldown, stable):
+    """Why heat keeps a job from starting at all, or None if it does not."""
+    if state >= SERIOUS or (stable and state > NOMINAL):
+        reason = "thermal state is {}".format(THERMAL_NAMES.get(state, state))
+        return reason + "; --stable needs nominal" if stable and state < SERIOUS else reason
+    if cooldown > 0:
+        return "cooling down for {:.0f}s after thermal pressure".format(cooldown)
+    if stable and warm_cooldown > 0:
+        return "cooling down for {:.0f}s at nominal before a --stable run".format(warm_cooldown)
+    return None
+
+
+def acquire(requested, want, held, max_wait, stable):
+    start = time.time()
+    delay = 1.0
+    last_reason = None
+    barriers = {}
+    try:
+        while True:
+            state, cooldown, warm_cooldown = read_thermal()
+            reason = too_hot_to_start(state, cooldown, warm_cooldown, stable)
+            if reason is not None:
+                # Held up by heat rather than by a sharer, so nothing is owed a
+                # barrier; try_admit keeps its own.
+                sync_barriers(barriers, set())
+            else:
+                fds, lease_fd, share, reason = try_admit(
+                    requested, want, held, state, stable, barriers)
+                if reason is None:
+                    return fds, lease_fd, share, state
+            if reason != last_reason:
+                log("waiting: " + reason)
+                last_reason = reason
+            waited = time.time() - start
+            if max_wait and waited >= max_wait:
+                return None, None, None, state
+            time.sleep(min(delay, max_wait - waited) if max_wait else delay)
+            delay = min(delay * 1.5, 2.0)
+    finally:
+        for fd in barriers.values():
+            os.close(fd)
+
+
+def kill_group(pgid, sig):
+    try:
+        os.killpg(pgid, sig)
+    # macOS answers EPERM, not ESRCH, for a group left with only exited members,
+    # which is what a job that started background work usually leaves behind.
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def terminate(proc):
+    kill_group(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        kill_group(proc.pid, signal.SIGKILL)
+        proc.wait()
+
+
+def write_info(slot, info):
+    tmp = info_path(slot) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(info, f)
+    os.replace(tmp, info_path(slot))
+
+
+def write_text(fd, text):
+    """Replace a locked file's contents in place, so the lock never moves."""
+    data = text.encode()
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, data)
+    os.ftruncate(fd, len(data))
+
+
+def write_lease(fd, record):
+    write_text(fd, json.dumps(record))
+
+
+def remove_info(slot):
+    info = read_info(slot)
+    if info and info.get("wrapper_pid") == os.getpid():
+        try:
+            os.remove(info_path(slot))
+        except OSError:
+            pass
+
+
+def positive_int(text):
+    if not text.isdigit() or int(text) < 1:
+        raise argparse.ArgumentTypeError("--cpus takes a whole number of cores, at least 1")
+    return int(text)
+
+
+def parse_slots(text):
+    slots = {s.strip() for s in text.split(",") if s.strip()}
+    unknown = slots - set(SLOTS)
+    if not slots or unknown:
+        raise argparse.ArgumentTypeError("--needs takes gpu, cpu, or gpu,cpu")
+    return slots
+
+
+def held_amount(name):
+    value = os.environ.get(name, "")
+    return int(value) if value.isdigit() else 0
+
+
+def declared_env(env, args):
+    """Hand the job what it declared, so it can size itself to its own claim."""
+    if args.cpus:
+        inherited = env.get("HWGATE_CPUS")
+        env["HWGATE_CPUS"] = str(args.cpus)
+        for var in THREAD_VARS:
+            # A value equal to the enclosing job's claim was put there by hwgate, not
+            # chosen by the caller, so this job's own declaration replaces it. Without
+            # this a job declaring 2 cores inside one declaring 8 runs 8 threads.
+            if env.get(var) == inherited:
+                env[var] = str(args.cpus)
+            else:
+                env.setdefault(var, str(args.cpus))
+    return env
+
+
+def inside_another_job(held_from_env):
+    """Whether this hwgate was started from within a job hwgate already admitted.
+
+    Asks the ledger first, because the process group cannot be scrubbed; falls
+    back to what the environment claims, which is all an old or group-changed
+    parent leaves behind. For --stable either signal is enough: refusing costs a
+    message, and admitting costs measurements nobody can trust.
+    """
+    with admit_lock(timeout=1.0) as locked:
+        if locked and inside_gated_job(scan_leases()):
+            return True
+    return bool(held_from_env)
+
+
+def charge_extra(extra, command):
+    """Add what a nested job declares beyond its parent's reservation to the ledger.
+
+    The lease outlives this exec, so it carries this process as its own job and
+    is inheritable. Nothing deletes it: like every lease, it is reaped once its
+    flock can be taken, which happens when the exec'd job finally exits.
+    """
+    try:
+        fd, _ = new_lease(extra, (), ())
+        write_lease(fd, {
+            "wrapper_pid": os.getpid(),
+            "child_pid": os.getpid(),
+            "pgid": os.getpgrp(),
+            "child_start": process_start(os.getpid()),
+            "cmd": " ".join(command)[:500],
+            "cwd": os.getcwd(),
+            "slots": [],
+            "shared": [],
+            "cpus": extra,
+            "started": time.time(),
+        })
+        os.set_inheritable(fd, True)
+    except OSError as e:
+        log("cannot record this nested job's extra {} cores ({}); it still runs, but the ledger"
+            " will understate the machine until it exits".format(extra, e))
+
+
+def cmd_run(args):
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        log("no command given; usage: hwgate run --needs gpu -- <command>")
+        return EXIT_USAGE
+    needs = set(args.needs) | ({"cpu"} if args.cpus else set())
+    want = args.cpus or (fair_share_cores() if "cpu" in needs else 0)
+    if want > cpu_budget():
+        log("--cpus {} is more than the {} cores this machine hands out (HWGATE_CPU_BUDGET)".format(
+            args.cpus, cpu_budget()))
+        return EXIT_USAGE
+
+    held = parse_slots(os.environ[HELD_ENV]) if os.environ.get(HELD_ENV) else set()
+    held_cpus = held_amount(HELD_CPUS_ENV)
+    if args.stable and inside_another_job(held):
+        log("--stable cannot run inside another gated job: it cannot take the slots that job already"
+            " holds, hold out for nominal heat, or watch for throttling, so its numbers would be"
+            " measured under conditions it never established. Run it outside that job")
+        return EXIT_USAGE
+    if needs <= held:
+        extra = max(0, want - held_cpus)
+        env = declared_env(dict(os.environ), args)
+        if extra:
+            # It cannot be refused -- waiting for its own parent could not end --
+            # but the ledger must still say what is running, or a job that can
+            # wait is admitted against a figure that is too small.
+            log("nested job asks for {} cores inside a job that reserved {}; running it straight"
+                " through and charging the difference, because waiting for its own parent could"
+                " not end".format(want, held_cpus))
+            charge_extra(extra, command)
+            env[HELD_CPUS_ENV] = str(max(held_cpus, want))
+        # Even here the job is handed what it declared: the shortcut skips
+        # admission, not the contract that --cpus reaches the command.
+        os.execvpe(command[0], command, env)
+    want = max(0, want - held_cpus)
+
+    fds, lease, share, state = acquire(needs, want, held, args.max_wait, args.stable)
+    if fds is None:
+        log("gave up after waiting {}s; nothing was started".format(args.max_wait))
+        return EXIT_GAVE_UP
+    lease_fd, lease_file = lease
+
+    env = declared_env(dict(os.environ), args)
+    env[HELD_ENV] = ",".join(s for s in SLOTS if s in held or s in fds)
+    env[HELD_CPUS_ENV] = str(held_cpus + want)
+    deadline = time.time() + args.timeout if args.timeout > 0 else None
+    # The job inherits the slot locks, so a slot stays taken while the job
+    # really runs, even if this wrapper is killed.
+    proc = subprocess.Popen(
+        command, env=env, start_new_session=True, pass_fds=tuple(fds.values()) + (lease_fd,))
+    # Reaping needs the start time to tell this job from a recycled pid, so the
+    # record is useless until ps answers. The gap is the ps call, as it always was.
+    info = {
+        "wrapper_pid": os.getpid(),
+        "child_pid": proc.pid,
+        "pgid": proc.pid,
+        "child_start": process_start(proc.pid),
+        "cmd": " ".join(command)[:500],
+        "cwd": os.getcwd(),
+        "slots": sorted(fds),
+        "shared": sorted(share),
+        "cpus": want,
+        "thermal_at_start": THERMAL_NAMES.get(state, state),
+        "stable": args.stable,
+        "started": time.time(),
+        "deadline": deadline,
+    }
+    write_lease(lease_fd, info)
+    # A shared slot has several holders, so it has no one holder to name; those
+    # jobs are listed by their leases instead.
+    for slot in set(fds) - share:
+        write_info(slot, info)
+
+    def forward(signum, _frame):
+        kill_group(proc.pid, signal.SIGTERM)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, forward)
+
+    watch = ThrottleWatch(needs, args.throttle_budget) if args.stable else None
+    try:
+        while True:
+            try:
+                rc = proc.wait(timeout=1.0)
+                break
+            except subprocess.TimeoutExpired:
+                if deadline and time.time() >= deadline:
+                    log("timeout after {}s; killing the job's process group".format(args.timeout))
+                    terminate(proc)
+                    rc = EXIT_TIMEOUT
+                    break
+                # Read every run, so heat caused by any job delays the next --stable one.
+                now_state = read_thermal()[0]
+                reason = watch.check(now_state) if watch else None
+                if reason:
+                    log(
+                        "ABORTED --stable job after {:.0f}s: throttled ({}, budget {:.0f}s). "
+                        "It did not get stable performance, so treat its partial results as invalid. "
+                        "Rerun it; hwgate waits {:.0f}s of cooldown at nominal first.".format(
+                            time.time() - info["started"], reason, args.throttle_budget, COOLDOWN
+                        )
+                    )
+                    terminate(proc)
+                    rc = EXIT_UNSTABLE
+                    break
+        if watch and rc != EXIT_UNSTABLE:
+            log("--stable run: " + watch.summary())
+    finally:
+        # Anything the job left behind in its group dies with it.
+        kill_group(proc.pid, signal.SIGKILL)
+        for slot in set(fds) - share:
+            remove_info(slot)
+        try:
+            os.remove(lease_file)
+        except OSError:
+            pass
+        for fd in list(fds.values()) + [lease_fd]:
+            os.close(fd)
+    return 128 - rc if rc < 0 else rc
+
+
+def cmd_status(_args):
+    state, cooldown, warm_cooldown = read_thermal()
+    line = "thermal: {}".format(THERMAL_NAMES.get(state, state))
+    if cooldown > 0 and state < SERIOUS:
+        line += " (cooling down, {:.0f}s left)".format(cooldown)
+    elif warm_cooldown > 0 and state == NOMINAL:
+        line += " (--stable admits in {:.0f}s)".format(warm_cooldown)
+    print(line)
+    # Read before the lock, as run does: an unreadable lease is charged the whole budget,
+    # and working that out may ask sysctl, which nothing should wait on under the lock.
+    cpu_budget()
+    # Reporting is not worth a long wait, and a read-only command must not reap.
+    with admit_lock(timeout=1.0) as locked:
+        leases = scan_leases() if locked else None
+    if leases is None:
+        print("budget: unknown, another hwgate is holding the admission lock")
+        leases = []
+    else:
+        # What declaring jobs hold, not what the machine is using.
+        print("budget: {}/{} cores declared".format(
+            sum(lease["cpus"] for lease in leases), cpu_budget()))
+    for slot in SLOTS:
+        waiting = barrier_holder(slot)
+        waiting = "\n    {} is waiting for the whole slot, so new jobs hold back".format(
+            waiting) if waiting else ""
+        fd = try_lock(slot)
+        if fd is not None:
+            os.close(fd)
+            print("{}: free{}".format(slot, waiting))
+            continue
+        shared_fd = try_lock(slot, shared=True)
+        if shared_fd is not None:
+            os.close(shared_fd)
+            # Listed on the same field the count uses, so every job counted is named;
+            # reading "shared" instead leaves out a lease that predates that field.
+            sharers = [lease for lease in leases if slot in lease["slots"]]
+            print("{}: {} of {} jobs{}".format(
+                slot, slot_occupants(slot, leases), SLOT_PARALLEL, waiting))
+            for lease in sharers:
+                print("    {} cores, {}".format(lease["cpus"], describe_holder(lease)))
+            continue
+        info = read_info(slot)
+        if not info:
+            print("{}: busy (holder unknown){}".format(slot, waiting))
+            continue
+        left = ""
+        if info.get("deadline"):
+            left = ", {:.0f}s to deadline".format(info["deadline"] - time.time())
+        wrapper = "" if pid_alive(info["wrapper_pid"]) else ", wrapper gone"
+        stable = ", --stable" if info.get("stable") else ""
+        print("{}: busy, pid {} for {:.0f}s{}{}{}{}\n    {}\n    in {}".format(
+            slot, info["child_pid"], time.time() - info["started"], left, wrapper, stable, waiting,
+            info["cmd"], info["cwd"]
+        ))
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="hwgate", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="action", required=True)
+    run = sub.add_parser("run", help="run a command once its slots are free and the machine is cool enough")
+    run.add_argument("--needs", type=parse_slots, required=True, help="gpu, cpu, or gpu,cpu")
+    run.add_argument("--cpus", type=positive_int, help="cores this job will use: charges that many to the cpu budget instead of a share of the pool, so honest declarations fit more work on the machine")
+    run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds before the job is killed; 0 disables (default %(default)s)")
+    run.add_argument("--max-wait", type=float, default=0, help="seconds to wait for admission before exiting 75; 0 waits forever")
+    run.add_argument("--stable", action="store_true", help="needs stable performance: start alone at nominal after a cooldown, abort with 76 once throttled")
+    run.add_argument("--throttle-budget", type=float, default=DEFAULT_THROTTLE_BUDGET, help="--stable: seconds of continuous throttling (heat plus a frequency drop) tolerated before aborting (default %(default)s)")
+    run.add_argument("command", nargs=argparse.REMAINDER)
+    sub.add_parser("status", help="show thermal state and who holds each slot")
+    args = parser.parse_args()
+    os.makedirs(os.path.join(STATE_DIR, "leases"), exist_ok=True)
+    return cmd_run(args) if args.action == "run" else cmd_status(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
