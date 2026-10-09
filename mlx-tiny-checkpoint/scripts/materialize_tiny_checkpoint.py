@@ -36,8 +36,13 @@ TOKENIZER_FILES = (
     "merges.txt", "special_tokens_map.json", "added_tokens.json",
     "chat_template.jinja", "chat_template.json", "preprocessor_config.json",
     "processor_config.json", "image_preprocessor_config.json",
-    "video_preprocessor_config.json",
+    "video_preprocessor_config.json", "tokenizer.jsonl", "vocab.txt", "spiece.model",
+    "sentencepiece.bpe.model",
 )
+# Repos whose tokenizer or processor is remote code name it in an auto_map and ship the
+# module beside the config. Without it the tiny checkpoint cannot be opened at all, which
+# reads as "family unsupported" when nothing about the family was tested.
+TOKENIZER_SUFFIXES = (".py", ".tiktoken")
 
 
 METADATA_FILES = ("config.json", "generation_config.json", "configuration.json",
@@ -55,7 +60,9 @@ def is_metadata(name: str) -> bool:
         return False
     if name.endswith(".index.json"):  # names the shards; contains none of them
         return True
-    return name in METADATA_FILES and not name.endswith(WEIGHT_SUFFIXES)
+    if name.endswith(WEIGHT_SUFFIXES):
+        return False
+    return name in METADATA_FILES or name.endswith(TOKENIZER_SUFFIXES)
 
 
 def fetch_metadata(repo: str, revision: str | None) -> Path:
@@ -171,6 +178,52 @@ def estimated_params(cfg: dict) -> float:
     return g("vocab_size") * hidden + layers * (4 * hidden ** 2 + 3 * hidden * inter * experts)
 
 
+def remapped(package: str, arch: str) -> str:
+    """The module a backend builds `model_type` with: both keep a MODEL_REMAPPING
+    (`phi4-siglip` -> `phi4_siglip`), and importing the raw name instead reports an
+    implemented family as missing."""
+    try:
+        table = importlib.import_module(f"{package}.utils").MODEL_REMAPPING
+    except Exception:
+        table = {}
+    default = arch.lower() if package == "mlx_vlm" else arch
+    return table.get(arch.lower(), table.get(arch, default))
+
+
+def _import_arch(package: str, arch: str):
+    module = f"{package}.models.{remapped(package, arch)}"
+    try:
+        return importlib.import_module(module), module
+    except ModuleNotFoundError as e:
+        if e.name != module:  # the family exists; one of its own imports is missing
+            raise
+        return None, module
+
+
+def _build_lm(cfg: dict, arch: str):
+    pkg, module = _import_arch("mlx_lm", arch)
+    if pkg is None:
+        return None
+    return pkg.Model(pkg.ModelArgs.from_dict(cfg)), module
+
+
+def _build_vlm(cfg: dict, arch: str):
+    pkg, module = _import_arch("mlx_vlm", arch)
+    if pkg is None:
+        return None
+    # The same steps mlx_vlm.utils.load_model takes, so a config that builds here is one
+    # the loader builds too: defaulted sub-configs, then every module config converted.
+    from mlx_vlm.utils import update_module_configs
+    cfg = copy.deepcopy(cfg)
+    cfg.setdefault("text_config", cfg.pop("llm_config", {}))
+    cfg.setdefault("vision_config", {})
+    cfg.setdefault("audio_config", {})
+    model_cfg = update_module_configs(
+        pkg.ModelConfig.from_dict(cfg), pkg, cfg,
+        ["text", "vision", "perceiver", "projector", "audio"])
+    return pkg.Model(model_cfg), module
+
+
 def build_model(cfg: dict):
     """Instantiate from config alone. Raises if the architecture cannot build.
 
@@ -184,25 +237,36 @@ def build_model(cfg: dict):
         sys.exit("config.json has no model_type")
     multimodal = any(isinstance(cfg.get(k), dict)
                      for k in ("vision_config", "audio_config"))
-    if not multimodal:
-        try:
-            pkg = importlib.import_module(f"mlx_lm.models.{arch}")
-            return pkg.Model(pkg.ModelArgs.from_dict(cfg)), f"mlx_lm.models.{arch}"
-        except ModuleNotFoundError:
-            pass
-    try:
-        pkg = importlib.import_module(f"mlx_vlm.models.{arch}")
-        model_cfg = pkg.ModelConfig.from_dict(cfg)
-        for field in ("text_config", "vision_config", "audio_config"):
-            value = getattr(model_cfg, field, None)
-            if isinstance(value, dict):
-                cls_name = field.replace("_config", "").capitalize() + "Config"
-                setattr(model_cfg, field, getattr(pkg, cls_name).from_dict(value))
-        return pkg.Model(model_cfg), f"mlx_vlm.models.{arch}"
-    except ModuleNotFoundError:
-        pass
-    pkg = importlib.import_module(f"mlx_lm.models.{arch}")
-    return pkg.Model(pkg.ModelArgs.from_dict(cfg)), f"mlx_lm.models.{arch}"
+    order = (_build_vlm, _build_lm) if multimodal else (_build_lm, _build_vlm)
+    for build in order:
+        built = build(cfg, arch)
+        if built is not None:
+            return built
+    sys.exit(f"neither mlx_lm nor mlx_vlm has a module for model_type {arch!r} "
+             f"(looked for {remapped('mlx_lm', arch)!r} and {remapped('mlx_vlm', arch)!r})")
+
+
+def randomize_zero_parameters(model, std: float) -> list[str]:
+    """Give every all-zero float parameter small random values.
+
+    Constructors zero-initialise learned gates and residual scales (cross-attention gates,
+    per-layer lambdas, some embeddings). A trained checkpoint has real values there; a
+    random one keeps the zeros, which cuts the signal path: logits stop depending on the
+    input and adapters behind the gate get no gradient. That fails the load probe and the
+    adapter-movement check for a reason no real checkpoint has.
+    """
+    import mlx.core as mx
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    changed = []
+    for name, value in tree_flatten(model.parameters()):
+        if (mx.issubdtype(value.dtype, mx.floating) and value.size
+                and not mx.any(value != 0).item()):
+            changed.append((name, (mx.random.normal(value.shape) * std).astype(value.dtype)))
+    if changed:
+        model.update(tree_unflatten(changed))
+        mx.eval(model.parameters())
+    return [name for name, _ in changed]
 
 
 def report_name_overlap(names, index_path: Path) -> None:
@@ -264,6 +328,9 @@ def main() -> None:
                     help="build anyway; expect the process to be killed on a real config")
     ap.add_argument("--build-only", action="store_true",
                     help="build from config and report; write nothing")
+    ap.add_argument("--zero-init-std", type=float, default=0.2,
+                    help="std of the values written over all-zero float parameters; "
+                         "0 keeps the constructor's zeros")
     ap.add_argument("--seed", type=int, default=0,
                     help="random-weight seed; fixed so a rebuild reproduces the same checkpoint")
     args = ap.parse_args()
@@ -294,6 +361,8 @@ def main() -> None:
         out.mkdir(parents=True, exist_ok=True)
         src = resolve_snapshot(Path(args.tokenizer).expanduser())
         copied = [f for f in TOKENIZER_FILES if (src / f).exists()]
+        copied += sorted(f.name for f in src.iterdir()
+                         if f.is_file() and f.name.endswith(TOKENIZER_SUFFIXES))
         if not any(f.startswith("tokenizer") for f in copied):
             sys.exit(f"no tokenizer files under {src}")
         for name in copied:
@@ -318,6 +387,10 @@ def main() -> None:
     from mlx.utils import tree_flatten
 
     mx.eval(model.parameters())
+    rezeroed = randomize_zero_parameters(model, args.zero_init_std) if args.zero_init_std else []
+    if rezeroed:
+        print(f"  randomized {len(rezeroed)} all-zero parameters: {', '.join(rezeroed[:4])}"
+              f"{' ...' if len(rezeroed) > 4 else ''}")
     weights = dict(tree_flatten(model.parameters()))
     index = next((f for d in (fetched, config_path.parent) if d
                   for f in sorted(d.glob("*.index.json"))), None)

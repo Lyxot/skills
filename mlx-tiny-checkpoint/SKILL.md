@@ -115,5 +115,23 @@ is reachable. Families that pad `vocab_size` above their tokenizer, or put
 control ids above every ordinary token, are common enough that guessing costs
 more than fetching.
 
+Three things the materializer does so that a failure means something about the
+family rather than about the tiny checkpoint:
+
+- **Remote-code files travel with the tokenizer.** A repo whose tokenizer or
+  processor is declared in an `auto_map` ships the module beside its config;
+  top-level `*.py` (and `tokenizer.jsonl`, `*.tiktoken`) are fetched and copied.
+  They only run where the loader is given `trust_remote_code=True`, which the
+  materializer itself does when it sizes the vocabulary.
+- **`model_type` is resolved the way the backend resolves it** — through its
+  `MODEL_REMAPPING`, and for mlx_vlm through the same sub-config conversion
+  `load_model` applies. Do not override `model_type` in `shrink.json` to make a
+  family build: the loader keys its processor patches on the published name.
+- **All-zero float parameters are given small random values**
+  (`--zero-init-std`, 0 to disable). Constructors zero learned gates and
+  residual scales; kept as zeros they cut the signal path, so logits stop
+  depending on the input and adapters behind the gate never move. No trained
+  checkpoint looks like that.
+
 Keep the checkpoints out of the workspace tree. `/tmp` or a
 `tempfile.TemporaryDirectory` is right; they are disposable.
