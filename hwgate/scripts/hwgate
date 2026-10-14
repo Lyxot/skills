@@ -42,8 +42,12 @@ Stable-performance jobs (--stable: benchmarks, timing or throughput runs):
     --throttle-budget seconds. Heat without a frequency drop, or a frequency
     drop at nominal, does not abort. The next --stable run waits out a fresh
     cooldown before it starts.
+  - with --min-freq-ratio R, are also killed with 76 once a busy watched unit
+    stays below R of its hardware maximum for longer than --throttle-budget,
+    whatever the heat;
   - print a summary of the frequencies and thermal peak they saw on exit,
-    next to each unit's hardware maximum from its DVFS table.
+    next to each unit's hardware maximum from its DVFS table, and a hint to
+    cool down and rerun when a unit's median fell below 85% of it.
   Frequencies come from IOReport DVFS residency (no sudo). If they cannot be
   read, throttling means the thermal state alone stays above nominal.
 
@@ -126,6 +130,8 @@ THREAD_VARS = (
 )
 BUSY = 0.5
 FREQ_DROP = 0.10
+# A --stable run whose median sits below this share of the hardware maximum gets a rerun hint.
+FREQ_ADVICE = 0.85
 # Per slot: IOReport group, subgroup, channel-name prefix, pmgr DVFS table key.
 FREQ_SOURCES = {
     "gpu": ("GPU Stats", "GPU Performance States", "GPUPH", "voltage-states9"),
@@ -397,13 +403,19 @@ class FreqSampler:
 class ThrottleWatch:
     """Decides when a --stable job has been throttled for longer than its budget."""
 
-    def __init__(self, slots, budget):
-        self.slots, self.budget = sorted(slots), budget
+    def __init__(self, slots, budget, min_ratio=None):
+        self.slots, self.budget, self.min_ratio = sorted(slots), budget, min_ratio
         self.nominal_mhz = {s: [] for s in self.slots}
+        self.nominal_busy = {s: [] for s in self.slots}
         self.min_mhz = {}
         self.max_mhz = freq_ceilings()
         self.peak_state = NOMINAL
         self.since = None
+        self.low_since = {}
+        unknown = [s for s in self.slots if s not in self.max_mhz]
+        if min_ratio and unknown:
+            log("cannot read the hardware maximum frequency of {}; --min-freq-ratio is not enforced there".format(
+                ", ".join(unknown)))
         try:
             self.sampler = FreqSampler(self.slots)
         except Exception as e:
@@ -420,9 +432,12 @@ class ThrottleWatch:
             except Exception as e:
                 self.sampler = None
                 log("lost CPU/GPU frequency readings ({}); --stable treats any thermal state above nominal as throttling".format(e))
-        slow = []
+        slow, low = [], []
+        now = time.time()
         for slot in self.slots:
             mhz, busy = freqs.get(slot, (0.0, 0.0))
+            if state == NOMINAL and self.sampler:
+                self.nominal_busy[slot].append(busy)
             # An idle unit clocks down on purpose and says nothing about throttling.
             if busy < BUSY:
                 continue
@@ -433,6 +448,20 @@ class ThrottleWatch:
                 base = statistics.median(self.nominal_mhz[slot])
                 if mhz < base * (1 - FREQ_DROP):
                     slow.append("{} at {:.0f} MHz vs {:.0f} MHz at nominal".format(slot, mhz, base))
+            ceiling = self.max_mhz.get(slot)
+            if not (self.min_ratio and ceiling):
+                continue
+            if mhz >= self.min_ratio * ceiling:
+                self.low_since.pop(slot, None)
+            elif slot not in self.low_since:
+                self.low_since[slot] = now
+                log("--stable: {} at {:.0f} MHz, below {:.0%} of its {:.0f} MHz hardware max; aborting if it"
+                    " stays there over {:.0f}s".format(slot, mhz, self.min_ratio, ceiling, self.budget))
+            elif now - self.low_since[slot] > self.budget:
+                low.append("{} below {:.0%} of its {:.0f} MHz hardware max for {:.0f}s".format(
+                    slot, self.min_ratio, ceiling, now - self.low_since[slot]))
+        if low:
+            return "; ".join(low)
         throttled = state > NOMINAL and (slow or self.sampler is None)
         if not throttled:
             if self.since is not None:
@@ -444,7 +473,7 @@ class ThrottleWatch:
             self.since = time.time()
             log("--stable: throttled ({}); aborting if it lasts over {:.0f}s".format(what, self.budget))
         if time.time() - self.since > self.budget:
-            return "{} for {:.0f}s".format(what, time.time() - self.since)
+            return "throttled ({}) for {:.0f}s".format(what, time.time() - self.since)
         return None
 
     def summary(self):
@@ -459,6 +488,24 @@ class ThrottleWatch:
                 part += ", hardware max {:.0f} MHz".format(self.max_mhz[slot])
             parts.append(part)
         return "; ".join(parts)
+
+    def advice(self):
+        """A rerun hint for each unit whose median at nominal fell below FREQ_ADVICE of its hardware max."""
+        lines = []
+        for slot in self.slots:
+            ceiling = self.max_mhz.get(slot)
+            if not ceiling or not self.nominal_mhz[slot]:
+                continue
+            median = statistics.median(self.nominal_mhz[slot])
+            if median >= FREQ_ADVICE * ceiling:
+                continue
+            lines.append(
+                "--stable: {} median {:.0f} MHz is {:.0%} of its {:.0f} MHz hardware max, busy {:.0%} of the"
+                " run at nominal. If the work kept it fully busy, heat or power limits are the likely cause:"
+                " cool down and rerun. If it was only partly busy, it clocks down on purpose and a cooldown is"
+                " unlikely to help.".format(
+                    slot, median, median / ceiling, ceiling, statistics.mean(self.nominal_busy[slot])))
+        return lines
 
 
 def try_lock(slot, shared=False):
@@ -1012,6 +1059,9 @@ def cmd_run(args):
 
     held = parse_slots(os.environ[HELD_ENV]) if os.environ.get(HELD_ENV) else set()
     held_cpus = held_amount(HELD_CPUS_ENV)
+    if args.min_freq_ratio is not None and not (args.stable and 0 < args.min_freq_ratio <= 1):
+        log("--min-freq-ratio needs --stable and a fraction in (0, 1], such as 0.85")
+        return EXIT_USAGE
     if args.stable and inside_another_job(held):
         log("--stable cannot run inside another gated job: it cannot take the slots that job already"
             " holds, hold out for nominal heat, or watch for throttling, so its numbers would be"
@@ -1077,7 +1127,7 @@ def cmd_run(args):
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, forward)
 
-    watch = ThrottleWatch(needs, args.throttle_budget) if args.stable else None
+    watch = ThrottleWatch(needs, args.throttle_budget, args.min_freq_ratio) if args.stable else None
     try:
         while True:
             try:
@@ -1094,7 +1144,7 @@ def cmd_run(args):
                 reason = watch.check(now_state) if watch else None
                 if reason:
                     log(
-                        "ABORTED --stable job after {:.0f}s: throttled ({}, budget {:.0f}s). "
+                        "ABORTED --stable job after {:.0f}s: {}, budget {:.0f}s. "
                         "It did not get stable performance, so treat its partial results as invalid. "
                         "Rerun it; hwgate waits {:.0f}s of cooldown at nominal first.".format(
                             time.time() - info["started"], reason, args.throttle_budget, STABLE_COOLDOWN
@@ -1105,6 +1155,8 @@ def cmd_run(args):
                     break
         if watch and rc != EXIT_UNSTABLE:
             log("--stable run: " + watch.summary())
+            for line in watch.advice():
+                log(line)
     finally:
         # Anything the job left behind in its group dies with it.
         kill_group(proc.pid, signal.SIGKILL)
@@ -1189,6 +1241,7 @@ def main():
     run.add_argument("--max-wait", type=float, default=0, help="seconds to wait for admission before exiting 75; 0 waits forever")
     run.add_argument("--stable", action="store_true", help="needs stable performance: start alone at nominal after a cooldown, abort with 76 once throttled")
     run.add_argument("--throttle-budget", type=float, default=DEFAULT_THROTTLE_BUDGET, help="--stable: seconds of continuous throttling (heat plus a frequency drop) tolerated before aborting (default %(default)s)")
+    run.add_argument("--min-freq-ratio", type=float, help="--stable: also abort with 76 once a busy unit stays below this fraction of its hardware maximum frequency for longer than --throttle-budget, whatever the heat (e.g. 0.85)")
     run.add_argument("command", nargs=argparse.REMAINDER)
     sub.add_parser("status", help="show thermal state and who holds each slot")
     args = parser.parse_args()

@@ -680,6 +680,82 @@ def test_frequencies_are_reported_against_the_hardware_maximum(gate):
     assert "hardware max {:.0f} MHz".format(max(tables["gpu"])) in result.stderr
 
 
+def forced_gpu_share(tmp_path, share):
+    """A frequency file pinning a fully busy GPU at `share` of this machine's real hardware max."""
+    table = load_hwgate().dvfs_tables().get("gpu")
+    if not table:
+        pytest.skip("no DVFS table on this machine")
+    path = tmp_path / "freq.json"
+    path.write_text(json.dumps({"gpu": [max(table) * share, 1.0]}))
+    return path
+
+
+# A hinted or aborted run needs samples, so it gets time to spare; the others pass however few it takes.
+@pytest.mark.parametrize("share, hinted, seconds", [(0.8, True, "6"), (0.9, False, "3")])
+def test_a_stable_run_below_85_percent_of_the_hardware_max_is_told_to_rerun(gate, tmp_path, share, hinted, seconds):
+    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sleep", seconds,
+                  HWGATE_FORCE_FREQ=forced_gpu_share(tmp_path, share))
+    assert result.returncode == 0
+    assert ("cool down and rerun" in result.stderr) is hinted, result.stderr
+
+
+@pytest.mark.parametrize("share, code, seconds", [(0.8, 76, "60"), (0.9, 0, "4")])
+def test_min_freq_ratio_aborts_a_run_that_stays_below_it(gate, tmp_path, share, code, seconds):
+    result = gate("run", "--needs", "gpu", "--stable", "--min-freq-ratio", "0.85", "--throttle-budget", "1",
+                  "--max-wait", "3", "--", "sleep", seconds, HWGATE_FORCE_FREQ=forced_gpu_share(tmp_path, share))
+    assert result.returncode == code, result.stderr
+    assert ("below 85% of its" in result.stderr) is (code == 76)
+
+
+def scripted_watch(monkeypatch, slots, min_ratio=None):
+    """A ThrottleWatch on a fake clock against 1000 MHz ceilings, fed samples by the caller."""
+    module = load_hwgate()
+    clock = [0.0]
+    monkeypatch.setenv("HWGATE_FORCE_FREQ", "unused")
+    monkeypatch.setattr(module, "time", types.SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(module, "freq_ceilings", lambda: {s: 1000.0 for s in slots})
+    monkeypatch.setattr(module, "log", lambda message: None)
+    watch = module.ThrottleWatch(slots, 10, min_ratio)
+
+    def feed(seconds_later, **samples):
+        clock[0] += seconds_later
+        watch.sampler = types.SimpleNamespace(sample=lambda: samples)
+        return watch.check(module.NOMINAL)
+
+    return watch, feed
+
+
+@pytest.mark.parametrize("median, hinted", [(849, True), (850, False)])
+def test_the_rerun_hint_starts_below_85_percent_and_reports_busy_share_of_the_run(monkeypatch, median, hinted):
+    watch, feed = scripted_watch(monkeypatch, ["gpu"])
+    for sample in [(median, 1.0), (median, 1.0), (0, 0.0), (0, 0.0)]:
+        feed(1, gpu=sample)
+    hint = watch.advice()
+    assert bool(hint) is hinted
+    if hinted:
+        assert "busy 50% of the run" in hint[0], hint
+
+
+def test_min_freq_ratio_times_each_unit_from_its_last_sample_at_speed(monkeypatch):
+    """Recovery restarts the clock, an idle sample does not, and a healthy cpu never clears the gpu's."""
+    _, feed = scripted_watch(monkeypatch, ["cpu", "gpu"], 0.85)
+    cpu = (1000, 1.0)
+    assert feed(0, gpu=(800, 1.0), cpu=cpu) is None    # low from t=0
+    assert feed(8, gpu=(850, 1.0), cpu=cpu) is None    # recovered, exactly at 85%
+    assert feed(2, gpu=(800, 1.0), cpu=cpu) is None    # low again from t=10
+    assert feed(8, gpu=(0, 0.0), cpu=cpu) is None      # idle: still counting
+    assert feed(2, gpu=(800, 1.0), cpu=cpu) is None    # 10s: not over the budget
+    reason = feed(1, gpu=(800, 1.0), cpu=cpu)          # 11s
+    assert reason and reason.startswith("gpu below 85% of its 1000 MHz") and "cpu" not in reason
+
+
+@pytest.mark.parametrize("args", [["--min-freq-ratio", "0.85"], ["--stable", "--min-freq-ratio", "1.5"]],
+                         ids=["without-stable", "not-a-fraction"])
+def test_min_freq_ratio_needs_stable_and_a_fraction(gate, args):
+    result = gate("run", "--needs", "gpu", *args, "--max-wait", "2", "--", "echo", "ran")
+    assert result.returncode == 2 and "ran" not in result.stdout
+
+
 def test_a_nested_job_is_charged_what_it_declares_beyond_its_parent(gate):
     """It cannot be made to wait for its own parent, but it can be counted."""
     result = gate("run", "--needs", "cpu", "--cpus", "2", "--", sys.executable, str(HWGATE),
