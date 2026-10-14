@@ -21,6 +21,7 @@ Snapshot entries are relative symlinks into `blobs/`. Hugging Face LFS blob name
 
 - ModelScope normally names its default branch `master`; Hugging Face normally exposes `main`. Their commit IDs are not interchangeable.
 - `refs/main` must contain the Hugging Face commit when Hugging Face tools are expected to resolve the cached model normally.
+- A ref file holds the 40-character commit and nothing else, with no trailing newline. `huggingface_hub` reads it verbatim, so `snapshot_download(..., local_files_only=True)` or `HF_HUB_OFFLINE=1` without an explicit revision fails with "Cannot find an appropriate cached snapshot folder" when one is present. Loads that pass the commit as the revision are unaffected, which hides the problem.
 - ModelScope may add `configuration.json` or use a different `.gitattributes`. Do not place those differences inside the Hugging Face snapshot.
 - Enumerate ModelScope tree entries recursively. Root-only API results can omit assets or nested tokenizer files.
 - Compute ordinary Git blobs with `git hash-object --no-filters`; global line-ending filters must not change the object ID.

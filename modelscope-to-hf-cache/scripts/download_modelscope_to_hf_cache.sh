@@ -243,7 +243,8 @@ while IFS="$tab" read -r file_path file_size ms_sha256; do
   fi
   link_blob "$repo_cache/snapshots/$ms_sha" "$file_path" "$blob_name"
 done < "$ms_files"
-printf '%s\n' "$ms_sha" > "$repo_cache/refs/modelscope"
+# No trailing newline: huggingface_hub reads a ref verbatim, so one makes offline lookups by branch fail.
+printf '%s' "$ms_sha" > "$repo_cache/refs/modelscope"
 
 while IFS="$tab" read -r file_path file_size hf_lfs hf_blob; do
   if [ "$hf_lfs" != '-' ]; then blob_name=$hf_lfs; else blob_name=$hf_blob; fi
@@ -269,7 +270,7 @@ while IFS="$tab" read -r file_path file_size hf_lfs hf_blob; do
   link_blob "$repo_cache/snapshots/$hf_sha" "$file_path" "$blob_name"
 done < "$hf_files"
 
-printf '%s\n' "$hf_sha" > "$repo_cache/refs/main"
+printf '%s' "$hf_sha" > "$repo_cache/refs/main"
 HF_ENDPOINT=$hf_endpoint hf cache verify "$repo" --revision "$hf_sha" \
   --cache-dir "$cache_root" --fail-on-missing-files --fail-on-extra-files
 find "$repo_cache/blobs" -maxdepth 1 -type f -name '*.incomplete' -exec rm -f {} \;

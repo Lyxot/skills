@@ -36,4 +36,6 @@ scripts/download_modelscope_to_hf_cache.sh \
 
 If the same repository ID does not exist on Hugging Face, stop and ask whether the user wants an HF-like ModelScope-only cache or a mapped Hugging Face repository. Those outcomes cannot provide the same `refs/main` and strict Hub verification guarantees.
 
+If an offline load by default revision fails with "Cannot find an appropriate cached snapshot folder" although the snapshot exists, the ref file has a trailing newline from an older run of the downloader. `scripts/repair_cache_refs.py [--dry-run]` strips it across the cache; it rewrites only refs that name an existing snapshot.
+
 Do not remove existing snapshots, cache repositories, or unrelated incomplete downloads unless the user explicitly requests cleanup. For cache invariants and troubleshooting, read [references/cache-layout.md](references/cache-layout.md).
