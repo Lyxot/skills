@@ -530,9 +530,11 @@ def test_a_job_inside_a_gated_job_is_recognised_without_its_environment(gate, tm
     go = tmp_path / "go"
     parent = subprocess.Popen(
         [sys.executable, str(HWGATE), "run", "--needs", "cpu", "--cpus", "4", "--", "sh", "-c",
-         "while [ ! -f {} ]; do sleep 0.1; done; exec "
+         # Bounded: a mutant that loses this shell must not leave it forking `sleep` forever.
+         "i=0; while [ ! -f {0} ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; "
+         "[ -f {0} ] || exit 1; exec "
          "env -u HWGATE_HELD -u HWGATE_HELD_CPUS "
-         "{} {} run --needs cpu "
+         "{1} {2} run --needs cpu "
          "--cpus 1 --max-wait 8 -- echo inner ran".format(go, sys.executable, HWGATE)],
         env=gate.environ(HWGATE_COOLDOWN=0), stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True)
