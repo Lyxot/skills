@@ -33,8 +33,8 @@ hard allocation failure rather than into running slower. A number the gate canno
 enforce and cannot derive correctly is worse than no number, so there is none.
 
 Stable-performance jobs (--stable: benchmarks, timing or throughput runs):
-  - start only at nominal, after HWGATE_COOLDOWN seconds without any reading
-    of fair or worse, and take every slot so nothing else competes;
+  - start only at nominal, after HWGATE_STABLE_COOLDOWN seconds without any
+    reading of fair or worse, and take every slot so nothing else competes;
   - are killed with exit 76 once they are throttled: the thermal state is
     above nominal AND a watched unit (the GPU for --needs gpu, the P-cores
     for --needs cpu) runs, while busy, more than 10% below its own median
@@ -42,7 +42,8 @@ Stable-performance jobs (--stable: benchmarks, timing or throughput runs):
     --throttle-budget seconds. Heat without a frequency drop, or a frequency
     drop at nominal, does not abort. The next --stable run waits out a fresh
     cooldown before it starts.
-  - print a summary of the frequencies and thermal peak they saw on exit.
+  - print a summary of the frequencies and thermal peak they saw on exit,
+    next to each unit's hardware maximum from its DVFS table.
   Frequencies come from IOReport DVFS residency (no sudo). If they cannot be
   read, throttling means the thermal state alone stays above nominal.
 
@@ -105,6 +106,7 @@ HELD_ENV = "HWGATE_HELD"
 HELD_CPUS_ENV = "HWGATE_HELD_CPUS"
 STATE_DIR = os.path.expanduser(os.environ.get("HWGATE_STATE_DIR", "~/.local/state/hwgate"))
 COOLDOWN = float(os.environ.get("HWGATE_COOLDOWN", "60"))
+STABLE_COOLDOWN = float(os.environ.get("HWGATE_STABLE_COOLDOWN", "120"))
 DEFAULT_THROTTLE_BUDGET = 10.0
 ADMIT_WAIT = 10.0
 # Jobs share a slot. This is how many may hold one at once; --stable takes it alone.
@@ -255,29 +257,30 @@ def thermal_state():
         return FAIR
 
 
-def _cooldown_left(marker, hot):
+def _cooldown_left(marker, hot, seconds):
     path = os.path.join(STATE_DIR, marker)
     if hot:
         with open(path, "w") as f:
             f.write(str(time.time()))
-        return COOLDOWN
+        return seconds
     try:
         with open(path) as f:
             last = float(f.read().strip() or 0)
     except (OSError, ValueError):
         last = 0.0
-    return max(0.0, last + COOLDOWN - time.time())
+    return max(0.0, last + seconds - time.time())
 
 
 def read_thermal():
-    """Return (state, cooldown owed after the last serious reading, cooldown owed after the last fair-or-worse one)."""
+    """Return (state, cooldown owed after the last serious reading, --stable cooldown owed after the last fair-or-worse one)."""
     state = thermal_state()
-    return state, _cooldown_left("last_hot", state >= SERIOUS), _cooldown_left("last_warm", state >= FAIR)
+    return (state, _cooldown_left("last_hot", state >= SERIOUS, COOLDOWN),
+            _cooldown_left("last_warm", state >= FAIR, STABLE_COOLDOWN))
 
 
 def dvfs_tables():
     """MHz per active DVFS state, lowest first, for each slot's unit."""
-    out = subprocess.run(["ioreg", "-r", "-n", "pmgr", "-a", "-d1"], capture_output=True, check=True).stdout
+    out = subprocess.run(["ioreg", "-r", "-n", "pmgr", "-a", "-d1"], capture_output=True, check=True, timeout=2).stdout
     props = plistlib.loads(out)[0]
     tables = {}
     for slot, (_, _, _, key) in FREQ_SOURCES.items():
@@ -287,6 +290,14 @@ def dvfs_tables():
         scale = 1e6 if freqs and max(freqs) > 1e8 else 1e3
         tables[slot] = [f / scale for f in freqs]
     return tables
+
+
+def freq_ceilings():
+    """Each unit's hardware maximum in MHz, the top of its DVFS table; empty when unreadable."""
+    try:
+        return {slot: max(table) for slot, table in dvfs_tables().items() if table}
+    except Exception:
+        return {}
 
 
 class FreqSampler:
@@ -388,6 +399,7 @@ class ThrottleWatch:
         self.slots, self.budget = sorted(slots), budget
         self.nominal_mhz = {s: [] for s in self.slots}
         self.min_mhz = {}
+        self.max_mhz = freq_ceilings()
         self.peak_state = NOMINAL
         self.since = None
         try:
@@ -437,10 +449,13 @@ class ThrottleWatch:
         parts = ["thermal peak {}".format(THERMAL_NAMES.get(self.peak_state, self.peak_state))]
         for slot in self.slots:
             if self.nominal_mhz[slot]:
-                parts.append("{} median {:.0f} MHz at nominal, min {:.0f} MHz while busy".format(
-                    slot, statistics.median(self.nominal_mhz[slot]), self.min_mhz[slot]))
+                part = "{} median {:.0f} MHz at nominal, min {:.0f} MHz while busy".format(
+                    slot, statistics.median(self.nominal_mhz[slot]), self.min_mhz[slot])
             else:
-                parts.append("{} never busy at nominal".format(slot))
+                part = "{} never busy at nominal".format(slot)
+            if slot in self.max_mhz:
+                part += ", hardware max {:.0f} MHz".format(self.max_mhz[slot])
+            parts.append(part)
         return "; ".join(parts)
 
 
@@ -1074,7 +1089,7 @@ def cmd_run(args):
                         "ABORTED --stable job after {:.0f}s: throttled ({}, budget {:.0f}s). "
                         "It did not get stable performance, so treat its partial results as invalid. "
                         "Rerun it; hwgate waits {:.0f}s of cooldown at nominal first.".format(
-                            time.time() - info["started"], reason, args.throttle_budget, COOLDOWN
+                            time.time() - info["started"], reason, args.throttle_budget, STABLE_COOLDOWN
                         )
                     )
                     terminate(proc)
@@ -1104,6 +1119,9 @@ def cmd_status(_args):
     elif warm_cooldown > 0 and state == NOMINAL:
         line += " (--stable admits in {:.0f}s)".format(warm_cooldown)
     print(line)
+    ceilings = freq_ceilings()
+    if ceilings:
+        print("hardware max: " + ", ".join("{} {:.0f} MHz".format(s, ceilings[s]) for s in sorted(ceilings)))
     # Read before the lock, as run does: an unreadable lease is charged the whole budget,
     # and working that out may ask sysctl, which nothing should wait on under the lock.
     cpu_budget()

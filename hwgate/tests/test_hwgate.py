@@ -623,6 +623,36 @@ def test_stable_runs_normally_when_nothing_encloses_it(gate):
     assert "stable run:" in result.stderr
 
 
+def test_stable_waits_longer_after_heat_than_other_jobs_do(gate, tmp_path):
+    """70s after both kinds of reading: past the 60s heat cooldown, inside the 120s --stable one."""
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    ago = time.time() - 70
+    (state / "last_warm").write_text(str(ago))
+    (state / "last_hot").write_text(str(ago))
+    before = time.time()
+    out = gate("status").stdout
+    after = time.time()
+    assert "cooling down" not in out
+    left = re.search(r"--stable admits in (\d+)s", out)
+    assert left and ago + 120 - after - 1 <= int(left.group(1)) <= ago + 120 - before + 1, out
+    assert gate("run", "--needs", "gpu", "--max-wait", "2", "--", "echo", "plain").returncode == 0
+    stable = gate("run", "--needs", "gpu", "--stable", "--max-wait", "2", "--", "echo", "measured")
+    assert stable.returncode == 75 and "before a --stable run" in stable.stderr
+    assert "measured" not in stable.stdout
+
+
+def test_frequencies_are_reported_against_the_hardware_maximum(gate):
+    tables = load_hwgate().dvfs_tables()
+    if not all(tables.values()):
+        pytest.skip("no DVFS table on this machine")
+    status = gate("status").stdout
+    for slot, table in tables.items():
+        assert "{} {:.0f} MHz".format(slot, max(table)) in status
+    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "echo", "measured")
+    assert "hardware max {:.0f} MHz".format(max(tables["gpu"])) in result.stderr
+
+
 def test_a_nested_job_is_charged_what_it_declares_beyond_its_parent(gate):
     """It cannot be made to wait for its own parent, but it can be counted."""
     result = gate("run", "--needs", "cpu", "--cpus", "2", "--", sys.executable, str(HWGATE),

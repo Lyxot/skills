@@ -28,14 +28,14 @@ hwgate run --needs cpu --cpus 4 --max-wait 300 -- python -m pytest -n 4 tests/
 ## How admission works
 
 - **Up to three jobs share each slot.** A fourth waits. A job that joins a busy slot prints the jobs already on it; quote that line if you report a duration from a shared run.
-- **`--stable` runs alone.** It takes every slot and starts only after 60s at nominal heat. If it is throttled for longer than `--throttle-budget` (default 10s), it is killed with exit 76. On success it prints a `--stable run:` frequency summary; quote it next to benchmark numbers. Put it on the outermost `hwgate` call only, and never use it for correctness tests.
+- **`--stable` runs alone.** It takes every slot and starts only after 120s at nominal heat. If it is throttled for longer than `--throttle-budget` (default 10s), it is killed with exit 76. On success it prints a `--stable run:` frequency summary, with each unit's hardware maximum beside what it reached; quote it next to benchmark numbers. Put it on the outermost `hwgate` call only, and never use it for correctness tests.
 - **`--cpus <n>`** charges `n` of the core budget (the 12 performance cores, or `HWGATE_CPU_BUDGET`) and exports `HWGATE_CPUS` and `OMP_NUM_THREADS` and friends. Pass the same `n` to `pytest -n`, not `auto`. A job that declares nothing is charged a third of the budget.
 - **There is no memory flag.** GPU memory here is wired and can't be swapped, so a job past it fails rather than slowing down. Size large models yourself, and use `--stable` to have the GPU to yourself.
 - **Heat:** at fair, one heavy job at a time. At serious or worse, nothing new starts until 60s after it clears. Running jobs are never stopped for heat.
 - **Timeout:** `--timeout` (default 7200s) kills the job's whole process group, as does the job exiting. `--timeout 0` disables the timeout and the cleanup.
 - **Nesting:** a gated job that calls `hwgate` again reuses its own slots.
 
-`hwgate status` shows the thermal state, the declared budget, and every job holding or waiting for a slot. `hwgate --help` has the details.
+`hwgate status` shows the thermal state, the CPU and GPU hardware maximum frequencies, the declared budget, and every job holding or waiting for a slot. `hwgate --help` has the details.
 
 ## Exit codes
 
