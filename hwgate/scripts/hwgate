@@ -109,6 +109,8 @@ COOLDOWN = float(os.environ.get("HWGATE_COOLDOWN", "60"))
 STABLE_COOLDOWN = float(os.environ.get("HWGATE_STABLE_COOLDOWN", "120"))
 DEFAULT_THROTTLE_BUDGET = 10.0
 ADMIT_WAIT = 10.0
+# A wait whose reason has not changed is repeated this often, so a long one does not look hung.
+WAIT_REMINDER = 60.0
 # Jobs share a slot. This is how many may hold one at once; --stable takes it alone.
 SLOT_PARALLEL = 3
 # Thread-pool knobs a declared core count answers. A value the caller chose is
@@ -840,7 +842,7 @@ def too_hot_to_start(state, cooldown, warm_cooldown, stable):
 def acquire(requested, want, held, max_wait, stable):
     start = time.time()
     delay = 1.0
-    last_reason = None
+    last_key, last_logged = None, 0.0
     barriers = {}
     try:
         while True:
@@ -855,9 +857,15 @@ def acquire(requested, want, held, max_wait, stable):
                     requested, want, held, state, stable, barriers)
                 if reason is None:
                     return fds, lease_fd, share, state
-            if reason != last_reason:
+            # Reasons carry running counters ("held ... for 668s"), which change every poll.
+            key = re.sub(r"\b\d+s\b", "", reason)
+            now = time.time()
+            if key != last_key:
                 log("waiting: " + reason)
-                last_reason = reason
+                last_key, last_logged = key, now
+            elif now - last_logged >= WAIT_REMINDER:
+                log("still waiting after {:.0f}s: {}".format(now - start, reason))
+                last_logged = now
             waited = time.time() - start
             if max_wait and waited >= max_wait:
                 return None, None, None, state

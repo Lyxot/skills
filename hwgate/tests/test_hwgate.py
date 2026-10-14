@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+import types
 
 import pytest
 
@@ -312,6 +313,30 @@ def test_only_a_stable_job_keeps_a_slot_to_itself(gate):
     result = gate("run", "--needs", "gpu", "--max-wait", "0.2", "--", "true")
     assert result.returncode == 75
     assert "gpu slot busy (held by pid" in result.stderr
+
+
+def test_a_wait_is_announced_once_while_only_its_counters_change(gate):
+    """The holder's running time ticks every poll; that alone is not news."""
+    gate.background("run", "--needs", "gpu", "--stable", "--", "sleep", "60", HWGATE_COOLDOWN=0)
+    result = gate("run", "--needs", "gpu", "--max-wait", "5", "--", "true")
+    assert result.returncode == 75
+    assert result.stderr.count("waiting: gpu slot busy (held by pid") == 1, result.stderr
+    assert "still waiting" not in result.stderr
+
+
+def test_a_long_wait_is_repeated_once_a_minute(monkeypatch):
+    module = load_hwgate()
+    clock = [1000.0]
+    monkeypatch.setattr(module, "time", types.SimpleNamespace(
+        time=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s)))
+    monkeypatch.setattr(module, "read_thermal", lambda: (0, 0.0, 0.0))
+    monkeypatch.setattr(module, "too_hot_to_start",
+                        lambda *a: "cooling down for {:.0f}s".format(1300 - clock[0]))
+    logged = []
+    monkeypatch.setattr(module, "log", logged.append)
+    assert module.acquire(["gpu"], 0, set(), 200, False)[0] is None
+    assert sum(m.startswith("waiting: ") for m in logged) == 1, logged
+    assert sum(m.startswith("still waiting after ") for m in logged) == 3, logged
 
 
 def test_declared_cpus_reach_the_job_as_thread_limits(gate):
