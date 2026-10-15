@@ -45,6 +45,10 @@ Stable-performance jobs (--stable: benchmarks, timing or throughput runs):
   - with --min-freq-ratio R, are also killed with 76 once a busy watched unit
     stays below R of its hardware maximum for longer than --throttle-budget,
     whatever the heat;
+  - run with every fan pinned at its maximum, handed back to macOS when the
+    job exits, through `sudo -n` on a root helper that
+    scripts/install-fan-helper.sh installs and a NOPASSWD rule allows;
+    hwgate itself never runs as root;
   - print a summary of the frequencies and thermal peak they saw on exit,
     next to each unit's hardware maximum from its DVFS table, and a hint to
     cool down and rerun when a unit's median fell below 85% of it.
@@ -78,6 +82,7 @@ throttling; 2 on bad usage or a request larger than the machine's budget.
 """
 
 import argparse
+import atexit
 import contextlib
 import ctypes
 import ctypes.util
@@ -111,6 +116,8 @@ HELD_CPUS_ENV = "HWGATE_HELD_CPUS"
 STATE_DIR = os.path.expanduser(os.environ.get("HWGATE_STATE_DIR", "~/.local/state/hwgate"))
 COOLDOWN = float(os.environ.get("HWGATE_COOLDOWN", "60"))
 STABLE_COOLDOWN = float(os.environ.get("HWGATE_STABLE_COOLDOWN", "120"))
+# Pins the fans at maximum for a --stable run once install-fan-helper.sh has run; empty disables.
+FAN_CMD = os.environ.get("HWGATE_FAN_CMD", "sudo -n /usr/local/libexec/hwgate-fan").split()
 DEFAULT_THROTTLE_BUDGET = 10.0
 ADMIT_WAIT = 10.0
 # A wait whose reason has not changed is repeated this often, so a long one does not look hung.
@@ -506,6 +513,62 @@ class ThrottleWatch:
                 " unlikely to help.".format(
                     slot, median, median / ceiling, ceiling, statistics.mean(self.nominal_busy[slot])))
         return lines
+
+
+def fan_helper_installed():
+    helper = FAN_CMD[-1] if FAN_CMD else None
+    return bool(helper) and (not os.path.isabs(helper) or os.path.exists(helper))
+
+
+def run_fans(mode):
+    """The fan helper's output for one mode; OSError says why it failed."""
+    try:
+        result = subprocess.run(FAN_CMD + [mode], capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        raise OSError("timed out")
+    if result.returncode:
+        lines = (result.stderr or result.stdout).strip().splitlines()
+        raise OSError(lines[-1] if lines else "exit {}".format(result.returncode))
+    return result.stdout
+
+
+_fans_owed = False
+
+
+def _exit_on_signal(signum, _frame):
+    sys.exit(128 + signum)
+
+
+def pin_fans():
+    """Pin the fans for a --stable run; release_fans() hands them back."""
+    global _fans_owed
+    if not FAN_CMD:
+        return
+    if not fan_helper_installed():
+        log("--stable: fans left on automatic; scripts/install-fan-helper.sh would pin them at maximum")
+        return
+    # Owed before the helper runs: a failed or interrupted pin may still have taken some fans.
+    _fans_owed = True
+    atexit.register(release_fans)
+    # Until the job's signal forwarding takes over, a signal must unwind through atexit.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _exit_on_signal)
+    try:
+        run_fans("max")
+        log("--stable: fans pinned at maximum until the job exits")
+    except OSError as e:
+        log("--stable: could not pin the fans at maximum: {}".format(e))
+
+
+def release_fans():
+    global _fans_owed
+    if not _fans_owed:
+        return
+    _fans_owed = False
+    try:
+        run_fans("auto")
+    except OSError as e:
+        log("--stable: could not return the fans to automatic ({}); run: {} auto".format(e, " ".join(FAN_CMD)))
 
 
 def try_lock(slot, shared=False):
@@ -1094,6 +1157,8 @@ def cmd_run(args):
     env[HELD_ENV] = ",".join(s for s in SLOTS if s in held or s in fds)
     env[HELD_CPUS_ENV] = str(held_cpus + want)
     deadline = time.time() + args.timeout if args.timeout > 0 else None
+    if args.stable:
+        pin_fans()
     # The job inherits the slot locks, so a slot stays taken while the job
     # really runs, even if this wrapper is killed.
     proc = subprocess.Popen(
@@ -1160,6 +1225,8 @@ def cmd_run(args):
     finally:
         # Anything the job left behind in its group dies with it.
         kill_group(proc.pid, signal.SIGKILL)
+        # While the slots are still held, or the next --stable run could pin them first.
+        release_fans()
         for slot in set(fds) - share:
             remove_info(slot)
         try:
@@ -1188,7 +1255,8 @@ def cmd_status(_args):
     # Reporting is not worth a long wait, and a read-only command must not reap.
     with admit_lock(timeout=1.0) as locked:
         leases = scan_leases() if locked else None
-    if leases is None:
+    leases_known = leases is not None
+    if not leases_known:
         print("budget: unknown, another hwgate is holding the admission lock")
         leases = []
     else:
@@ -1228,6 +1296,18 @@ def cmd_status(_args):
             slot, info["child_pid"], time.time() - info["started"], left, wrapper, stable, waiting,
             info["cmd"], info["cwd"]
         ))
+    if fan_helper_installed():
+        try:
+            pinned = re.search(r"^fan \d+: .*, manual$", run_fans("status"), re.M) is not None
+        except OSError as e:
+            print("fans: unknown ({})".format(e))
+        else:
+            if pinned and (not leases_known or any(lease.get("stable") for lease in leases)):
+                print("fans: pinned at maximum")
+            elif pinned:
+                # Only a wrapper killed outright skips handing them back.
+                print("fans: pinned at maximum with no --stable run; restore with: {} auto".format(
+                    " ".join(FAN_CMD)))
     return 0
 
 

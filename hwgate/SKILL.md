@@ -29,13 +29,14 @@ hwgate run --needs cpu --cpus 4 --max-wait 300 -- python -m pytest -n 4 tests/
 
 - **Up to three jobs share each slot.** A fourth waits. A job that joins a busy slot prints the jobs already on it; quote that line if you report a duration from a shared run.
 - **`--stable` runs alone.** It takes every slot and starts only after 120s at nominal heat. If it is throttled for longer than `--throttle-budget` (default 10s), it is killed with exit 76. On success it prints a `--stable run:` frequency summary, with each unit's hardware maximum beside what it reached; quote it next to benchmark numbers. If a unit's median fell below 85% of its maximum it also prints a hint with how busy the unit was: if the work kept it fully busy, heat or power limits are the likely cause, so cool down and rerun; if it was only partly busy, it clocks down on purpose and a cooldown is unlikely to help. Add `--min-freq-ratio 0.85` to abort with 76 instead once a busy unit stays below that share for longer than `--throttle-budget`; use it only for work that saturates the unit, or it aborts healthy runs. Put it on the outermost `hwgate` call only, and never use it for correctness tests.
+- **`--stable` pins the fans at maximum** for the whole run and hands them back to macOS when it exits, however it exits. hwgate itself never needs sudo: it runs `sudo -n /usr/local/libexec/hwgate-fan max|auto|status`, which the user sets up once per machine (agents can't, since it needs sudo): `sudo sh <skill dir>/scripts/install-fan-helper.sh`, then the `NOPASSWD` line it prints, added with `sudo visudo -f /etc/sudoers.d/hwgate-fan`. Until then, each `--stable` run says the fans stayed on automatic and runs anyway.
 - **`--cpus <n>`** charges `n` of the core budget (the 12 performance cores, or `HWGATE_CPU_BUDGET`) and exports `HWGATE_CPUS` and `OMP_NUM_THREADS` and friends. Pass the same `n` to `pytest -n`, not `auto`. A job that declares nothing is charged a third of the budget.
 - **There is no memory flag.** GPU memory here is wired and can't be swapped, so a job past it fails rather than slowing down. Size large models yourself, and use `--stable` to have the GPU to yourself.
 - **Heat:** at fair, one heavy job at a time. At serious or worse, nothing new starts until 60s after it clears. Running jobs are never stopped for heat.
 - **Timeout:** `--timeout` (default 7200s) kills the job's whole process group, as does the job exiting. `--timeout 0` disables the timeout and the cleanup.
 - **Nesting:** a gated job that calls `hwgate` again reuses its own slots.
 
-`hwgate status` shows the thermal state, the CPU and GPU hardware maximum frequencies, the declared budget, and every job holding or waiting for a slot. `hwgate --help` has the details.
+`hwgate status` shows the thermal state, the CPU and GPU hardware maximum frequencies, the declared budget, and every job holding or waiting for a slot. If the fans are still pinned with no `--stable` run holding them (its wrapper was killed outright), it prints the command that hands them back. `hwgate --help` has the details.
 
 ## Exit codes
 
