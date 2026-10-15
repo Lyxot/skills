@@ -781,6 +781,18 @@ if mode == "status":
 """
 
 
+@pytest.mark.parametrize("flags, seconds, hinted", [
+    (["--stable"], "2", True),
+    (["--stable"], "0", False),
+    ([], "2", False),
+], ids=["long-stable", "short-stable", "long-unstable"])
+def test_a_long_stable_run_is_told_to_give_each_case_its_own_run(gate, flags, seconds, hinted):
+    result = gate("run", "--needs", "gpu", *flags, "--max-wait", "3", "--", "sleep", seconds,
+                  HWGATE_STABLE_SPLIT_HINT="1")
+    assert result.returncode == 0, result.stderr
+    assert ("its own --stable run" in result.stderr) is hinted, result.stderr
+
+
 def fake_fan_helper(tmp_path, fail=(), block=(), status=""):
     """A helper recording the modes it is run with; it fails those in `fail` and hangs in those in `block`."""
     calls = tmp_path / "fan_calls"

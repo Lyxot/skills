@@ -49,6 +49,8 @@ Stable-performance jobs (--stable: benchmarks, timing or throughput runs):
     job exits, through `sudo -n` on a root helper that
     scripts/install-fan-helper.sh installs and a NOPASSWD rule allows;
     hwgate itself never runs as root;
+  - are reminded on exit, past HWGATE_STABLE_SPLIT_HINT seconds, to give each
+    benchmark case or A/B pair its own --stable run;
   - print a summary of the frequencies and thermal peak they saw on exit,
     next to each unit's hardware maximum from its DVFS table, and a hint to
     cool down and rerun when a unit's median fell below 85% of it.
@@ -116,6 +118,8 @@ HELD_CPUS_ENV = "HWGATE_HELD_CPUS"
 STATE_DIR = os.path.expanduser(os.environ.get("HWGATE_STATE_DIR", "~/.local/state/hwgate"))
 COOLDOWN = float(os.environ.get("HWGATE_COOLDOWN", "60"))
 STABLE_COOLDOWN = float(os.environ.get("HWGATE_STABLE_COOLDOWN", "120"))
+# A --stable run longer than this is reminded at exit to give each case its own run.
+STABLE_SPLIT_HINT = float(os.environ.get("HWGATE_STABLE_SPLIT_HINT", "600"))
 # Pins the fans at maximum for a --stable run once install-fan-helper.sh has run; empty disables.
 FAN_CMD = os.environ.get("HWGATE_FAN_CMD", "sudo -n /usr/local/libexec/hwgate-fan").split()
 DEFAULT_THROTTLE_BUDGET = 10.0
@@ -1223,6 +1227,11 @@ def cmd_run(args):
             log("--stable run: " + watch.summary())
             for line in watch.advice():
                 log(line)
+        held = time.time() - info["started"]
+        if args.stable and held > STABLE_SPLIT_HINT:
+            log("--stable: this run held the machine for {:.0f} min. If it timed several cases, give each case or A/B"
+                " pair its own --stable run: each then starts at nominal heat, a throttle abort costs one case, and other agents"
+                " get the machine in between.".format(held / 60))
     finally:
         # Anything the job left behind in its group dies with it.
         kill_group(proc.pid, signal.SIGKILL)

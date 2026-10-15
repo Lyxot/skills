@@ -1,6 +1,6 @@
 ---
 name: hwgate
-description: Run GPU and heavy CPU work through the machine-wide hwgate scheduler so agents on this machine take turns and back off when the Mac is hot. Use before running anything that touches MLX or Metal (`*_metal.py` tests, training, inference, benchmarks) or loads many cores (`pytest -n`, builds, CPU-bound scripts). Also use when a job is stuck waiting for a slot, or to see who is holding the GPU.
+description: Run GPU and heavy CPU work through the machine-wide hwgate scheduler so agents on this machine take turns and back off when the Mac is hot. Use before running anything that touches MLX or Metal (`*_metal.py` tests, training, inference, benchmarks) or loads many cores (`pytest -n`, builds, CPU-bound scripts). Benchmarks and speed comparisons run one `--stable` job per case or A/B pair, never one around the whole sweep. Also use when a job is stuck waiting for a slot, or to see who is holding the GPU.
 ---
 
 # hwgate
@@ -14,7 +14,7 @@ Several agents share this Mac. `hwgate` admits heavy jobs only when the machine 
 | MLX or Metal: `*_metal.py` tests, training, inference, `mlx.launch` | `hwgate run --needs gpu -- <cmd>` |
 | Many-core CPU work: `pytest -n`, builds, CPU-bound scripts | `hwgate run --needs cpu --cpus <n> -- <cmd>` |
 | Parallel Metal tests | `hwgate run --needs gpu,cpu -- <cmd>` |
-| Anything whose result is a speed (benchmarks, perf comparisons) | add `--stable` |
+| Anything whose result is a speed (benchmarks, perf comparisons) | add `--stable`, one run per case or A/B pair ([below](#benchmarks)) |
 
 Not needed for git, reading files, `uv sync`, or single-process non-MLX tests.
 
@@ -24,6 +24,32 @@ Always pass `--max-wait` shorter than your own tool timeout:
 hwgate run --needs gpu --max-wait 300 -- python -m pytest tests/test_x_metal.py -q
 hwgate run --needs cpu --cpus 4 --max-wait 300 -- python -m pytest -n 4 tests/
 ```
+
+## Benchmarks
+
+Give each case, or each A/B pair being compared, its own `--stable` run, and loop over cases outside `hwgate`, never inside one `--stable` job:
+
+- Every `--stable` run starts only at nominal heat, and only 120s after the last fair-or-worse reading, so a case that heated the machine is followed by a cooldown. In one long run only the first case gets that; later cases inherit the heat of earlier ones, which biases a comparison by order.
+- A throttling abort (exit 76) then costs one case, which you rerun, instead of the whole sweep.
+- Other agents get the machine between cases instead of waiting out the whole sweep.
+
+Inside an A/B pair, alternate A and B (ABAB…) in the same process so both see the same conditions; don't time all of A and then all of B. Cases of only a few seconds each can share a run, as long as it stays within a few minutes. A loop in a script file:
+
+```bash
+run_case() {  # rerun a case aborted for throttling (76) up to 3 times; any other failure stops the sweep
+  for attempt in 1 2 3; do
+    rc=0
+    hwgate run --needs gpu --stable --max-wait 1800 -- python bench.py --case "$1" || rc=$?
+    [ "$rc" -ne 76 ] && return "$rc"
+  done
+  return 76
+}
+for case in base fused; do
+  run_case "$case" || exit
+done
+```
+
+A `--stable` run over 10 minutes says so when it exits, as a reminder to split it.
 
 ## How admission works
 
