@@ -6,7 +6,11 @@
 //
 // Only ever raises fan speed: there is no command that sets a target below the maximum.
 #include <IOKit/IOKitLib.h>
+#include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <stdio.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -117,44 +121,59 @@ static int status(void) {
     return n > 0 ? 0 : 1;
 }
 
-static int set_max(void) {
-    int n = fan_count(), failed = 0;
-    if (!n) return fprintf(stderr, "hwgate-fan: no fans\n"), 1;
-    unsigned char on = 1;
-    // Apple Silicon ignores F<n>Md until the test-mode unlock is set; older SMCs have no Ftst.
-    int unlockable = write_key("Ftst", &on, 1) == 0;
-    for (int i = 0; i < n; i++) {
-        char k[5];
-        float maximum;
+// Apple Silicon ignores F<n>Md until the test-mode unlock is set; M5-era SMCs have no Ftst.
+static void request(int n, int manual) {
+    unsigned char flag = manual;
+    float maximum[n];
+    char k[5];
+    // No fan leaves automatic unless every maximum is known: manual at an old target is worse than auto.
+    for (int i = 0; i < n && manual; i++) {
         fan_key(k, i, "Mx");
-        if (read_float(k, &maximum)) { failed = 1; continue; }
-        int ok = 0;
-        // thermalmonitord takes a moment to release the fans after the unlock.
-        for (int attempt = 0; attempt < 20 && !ok; attempt++) {
-            mode_key(k, i);
-            ok = write_key(k, &on, 1) == 0;
-            fan_key(k, i, "Tg");
-            ok = ok && write_key(k, &maximum, 4) == 0;
-            if (!ok) usleep(250000);
-        }
-        failed |= !ok;
+        if (read_float(k, &maximum[i])) return;
     }
-    if (failed) fprintf(stderr, "hwgate-fan: could not pin every fan at max%s\n", unlockable ? "" : " (no Ftst unlock)");
-    return failed;
-}
-
-static int set_auto(void) {
-    int n = fan_count(), failed = 0;
-    unsigned char off = 0;
+    if (manual) write_key("Ftst", &flag, 1);
     for (int i = 0; i < n; i++) {
-        char k[5];
+        fan_key(k, i, "Tg");
+        if (manual && write_key(k, &maximum[i], 4)) continue;
         mode_key(k, i);
-        failed |= write_key(k, &off, 1) != 0;
+        write_key(k, &flag, 1);
     }
     int unlock;
-    if (read_u8("Ftst", &unlock) == 0) failed |= write_key("Ftst", &off, 1) != 0;
-    if (failed) fprintf(stderr, "hwgate-fan: could not return every fan to auto\n");
-    return failed;
+    if (!manual && read_u8("Ftst", &unlock) == 0) write_key("Ftst", &flag, 1);
+}
+
+static int settled(int n, int manual) {
+    int unlock, mode;
+    if (read_u8("Ftst", &unlock) == 0 && unlock != manual) return 0;
+    for (int i = 0; i < n; i++) {
+        char k[5];
+        float maximum, target;
+        mode_key(k, i);
+        if (read_u8(k, &mode) || mode != manual) return 0;
+        fan_key(k, i, "Mx");
+        if (manual && read_float(k, &maximum)) return 0;
+        fan_key(k, i, "Tg");
+        if (manual && (read_float(k, &target) || target < maximum - 1)) return 0;
+    }
+    return 1;
+}
+
+// The SMC applies writes up to ~0.8s after accepting them, so return only once the state has held
+// for longer than that: otherwise writes still pending from an earlier, possibly killed, call can
+// land after this one returns and undo it.
+static int set_mode(int manual) {
+    int n = fan_count(), held = 0;
+    if (!n) return fprintf(stderr, "hwgate-fan: no fans\n"), 1;
+    for (int tick = 0; tick < 100; tick++) {
+        if (!held && tick % 10 == 0) request(n, manual);  // re-issued each second until it holds
+        usleep(100000);
+        held = settled(n, manual) ? held + 1 : 0;
+        if (held >= 15) return 0;
+    }
+    fprintf(stderr, "hwgate-fan: fans did not hold %s for 1.5s within 10s\n", manual ? "max" : "auto");
+    // A partial pin is handed back rather than left for the whole run.
+    if (manual) set_mode(0);
+    return 1;
 }
 
 int main(int argc, char **argv) {
@@ -167,5 +186,17 @@ int main(int argc, char **argv) {
     IOObjectRelease(smc);
     if (!strcmp(cmd, "status")) return status();
     if (geteuid() != 0) return fprintf(stderr, "hwgate-fan: %s needs root\n", cmd), 1;
-    return !strcmp(cmd, "max") ? set_max() : set_auto();
+    // One max/auto at a time: killing sudo does not reach the helper (SIGKILL is not relayed), so an
+    // orphaned max would otherwise keep fighting the auto after it. The lock file is root-only (0600, in
+    // the directory install-fan-helper.sh verifies), so no other account can hold it.
+    char path[4096];
+    uint32_t size = sizeof(path) - 5;
+    if (_NSGetExecutablePath(path, &size)) return fprintf(stderr, "hwgate-fan: path too long\n"), 1;
+    strcat(path, ".lock");
+    int lock = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    if (lock < 0 || fchown(lock, 0, 0) || fchmod(lock, 0600) || flock(lock, LOCK_EX)) return fprintf(stderr, "hwgate-fan: cannot lock %s\n", path), 1;
+    int manual = !strcmp(cmd, "max");
+    // A max whose caller is gone was abandoned, and the auto that followed may already have run.
+    if (manual && getppid() == 1) return fprintf(stderr, "hwgate-fan: max abandoned by its caller\n"), 1;
+    return set_mode(manual);
 }
