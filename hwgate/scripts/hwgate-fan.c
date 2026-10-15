@@ -91,6 +91,13 @@ static int fan_count(void) {
 
 static void fan_key(char *out, int fan, const char *suffix) { snprintf(out, 5, "F%d%s", fan, suffix); }
 
+// M5-generation SMCs spell the mode key F<n>md and have no Ftst unlock.
+static void mode_key(char *out, int fan) {
+    KeyInfo info;
+    fan_key(out, fan, "Md");
+    if (key_info(out, &info)) fan_key(out, fan, "md");
+}
+
 static int status(void) {
     int n = fan_count(), unlock = -1;
     read_u8("Ftst", &unlock);
@@ -103,7 +110,7 @@ static int status(void) {
         fan_key(k, i, "Mn"); read_float(k, &minimum);
         fan_key(k, i, "Mx"); read_float(k, &maximum);
         fan_key(k, i, "Tg"); read_float(k, &target);
-        fan_key(k, i, "Md"); read_u8(k, &mode);
+        mode_key(k, i); read_u8(k, &mode);
         printf("fan %d: %.0f rpm (min %.0f, max %.0f, target %.0f), %s\n", i, actual, minimum, maximum,
                target, mode == 1 ? "manual" : mode == 0 ? "auto" : "mode unknown");
     }
@@ -124,7 +131,7 @@ static int set_max(void) {
         int ok = 0;
         // thermalmonitord takes a moment to release the fans after the unlock.
         for (int attempt = 0; attempt < 20 && !ok; attempt++) {
-            fan_key(k, i, "Md");
+            mode_key(k, i);
             ok = write_key(k, &on, 1) == 0;
             fan_key(k, i, "Tg");
             ok = ok && write_key(k, &maximum, 4) == 0;
@@ -141,7 +148,7 @@ static int set_auto(void) {
     unsigned char off = 0;
     for (int i = 0; i < n; i++) {
         char k[5];
-        fan_key(k, i, "Md");
+        mode_key(k, i);
         failed |= write_key(k, &off, 1) != 0;
     }
     int unlock;
