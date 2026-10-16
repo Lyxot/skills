@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import plistlib
 import re
 import signal
 import subprocess
@@ -87,6 +88,7 @@ def gate(tmp_path):
         # The machine's real heat would otherwise decide whether a test's job is
         # admitted at all, and the suite runs while other agents load the Mac.
         env["HWGATE_FORCE_THERMAL"] = "0"
+        env["HWGATE_FORCE_BACKUP"] = "0"
         # Once the real helper is installed, every --stable test would spin the fans up.
         env["HWGATE_FAN_CMD"] = ""
         for key, value in extra.items():
@@ -669,6 +671,46 @@ def test_stable_waits_longer_after_heat_than_other_jobs_do(gate, tmp_path):
     stable = gate("run", "--needs", "gpu", "--stable", "--max-wait", "2", "--", "echo", "measured")
     assert stable.returncode == 75 and "before a --stable run" in stable.stderr
     assert "measured" not in stable.stdout
+
+
+def test_a_running_backup_holds_back_only_stable_jobs(gate):
+    assert "time machine: backing up" in gate("status", HWGATE_FORCE_BACKUP=1).stdout
+    assert gate("run", "--needs", "gpu", "--max-wait", "2", "--", "true", HWGATE_FORCE_BACKUP=1).returncode == 0
+    stable = gate("run", "--needs", "gpu", "--stable", "--max-wait", "2", "--", "echo", "measured",
+                  HWGATE_FORCE_BACKUP=1)
+    assert stable.returncode == 75 and "Time Machine backup is running" in stable.stderr
+    assert "measured" not in stable.stdout
+
+
+def test_a_backup_starting_mid_run_aborts_a_stable_job(gate, tmp_path):
+    backup = tmp_path / "backup"
+    backup.write_text("0")
+    proc = gate.background("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sleep", "60",
+                           HWGATE_FORCE_BACKUP=backup)
+    # Past the first check, so only a repeated one can see the backup.
+    time.sleep(2)
+    backup.write_text("1")
+    _, err = proc.communicate(timeout=20)
+    assert proc.returncode == 76 and "Time Machine backup started" in err, err
+
+
+@pytest.mark.parametrize("reply, running", [
+    (plistlib.dumps({"ClientID": "com.apple.backupd", "Running": True, "BackupPhase": "Copying"}), True),
+    (plistlib.dumps({"ClientID": "com.apple.backupd", "Running": False, "Percent": -1}), False),
+    (b"not a plist", False),
+], ids=["running", "idle", "unreadable"])
+def test_backups_are_read_from_tmutil(monkeypatch, reply, running):
+    module = load_hwgate()
+    monkeypatch.delenv("HWGATE_FORCE_BACKUP", raising=False)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=reply)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    assert module.backup_running() is running
+    assert calls == [["tmutil", "status", "-X"]]
 
 
 def test_frequencies_are_reported_against_the_hardware_maximum(gate):

@@ -55,6 +55,7 @@ A `--stable` run over 10 minutes says so when it exits, as a reminder to split i
 
 - **Up to three jobs share each slot.** A fourth waits. A job that joins a busy slot prints the jobs already on it; quote that line if you report a duration from a shared run.
 - **`--stable` runs alone.** It takes every slot and starts only after 120s at nominal heat. If it is throttled for longer than `--throttle-budget` (default 10s), it is killed with exit 76. On success it prints a `--stable run:` frequency summary, with each unit's hardware maximum beside what it reached; quote it next to benchmark numbers. If a unit's median fell below 85% of its maximum it also prints a hint with how busy the unit was: if the work kept it fully busy, heat or power limits are the likely cause, so cool down and rerun; if it was only partly busy, it clocks down on purpose and a cooldown is unlikely to help. Add `--min-freq-ratio 0.85` to abort with 76 instead once a busy unit stays below that share for longer than `--throttle-budget`; use it only for work that saturates the unit, or it aborts healthy runs. Put it on the outermost `hwgate` call only, and never use it for correctness tests.
+- **`--stable` avoids Time Machine backups.** It waits to start while a backup runs, and is killed with exit 76 if one starts mid-run (checked every 5s), since a backup's disk and CPU load skews timings.
 - **`--stable` pins the fans at maximum** for the whole run and hands them back to macOS when it exits, however it exits. hwgate itself never needs sudo: it runs `sudo -n /usr/local/libexec/hwgate-fan max|auto|status`, which the user sets up once per machine (agents can't, since it needs sudo): `sudo sh <skill dir>/scripts/install-fan-helper.sh`, then the `NOPASSWD` line it prints, added with `sudo visudo -f /etc/sudoers.d/hwgate-fan`. Until then, each `--stable` run says the fans stayed on automatic and runs anyway.
 - **`--cpus <n>`** charges `n` of the core budget (the 12 performance cores, or `HWGATE_CPU_BUDGET`) and exports `HWGATE_CPUS` and `OMP_NUM_THREADS` and friends. Pass the same `n` to `pytest -n`, not `auto`. A job that declares nothing is charged a third of the budget.
 - **There is no memory flag.** GPU memory here is wired and can't be swapped, so a job past it fails rather than slowing down. Size large models yourself, and use `--stable` to have the GPU to yourself.
@@ -72,7 +73,7 @@ A `--stable` run over 10 minutes says so when it exits, as a reminder to split i
 | 75 | `--max-wait` ran out; nothing started | check `hwgate status`, retry later |
 | 124 | the job hit `--timeout` | it hung, or needs a longer `--timeout` |
 | 2 | bad usage, `--cpus` over the budget, or nested `--stable` | fix the request |
-| 76 | `--stable` job aborted for throttling, or for staying below `--min-freq-ratio` | discard partial numbers and rerun later; it waits for the cooldown itself |
+| 76 | `--stable` job aborted for throttling, for staying below `--min-freq-ratio`, or for a Time Machine backup | discard partial numbers and rerun later; it waits for the cooldown or backup itself |
 
 `hwgate:` lines on stderr say why a job is waiting and who holds the slot.
 
@@ -80,6 +81,6 @@ A `--stable` run over 10 minutes says so when it exits, as a reminder to split i
 
 - Never run gated work outside `hwgate` because the slot is busy. Wait or retry.
 - Never under-declare `--cpus`; nothing enforces it, so a wrong number oversubscribes the machine for everyone.
-- Never set `HWGATE_FORCE_THERMAL` or `HWGATE_STATE_DIR` outside hwgate's own tests.
+- Never set `HWGATE_FORCE_THERMAL`, `HWGATE_FORCE_BACKUP` or `HWGATE_STATE_DIR` outside hwgate's own tests.
 - Don't wrap commands that leave a background process behind (`sh -c 'server &'`): it is killed when the job returns.
 - Kill only your own job, by the pid from `hwgate status`. Don't delete lock files.
