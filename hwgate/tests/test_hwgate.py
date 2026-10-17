@@ -89,6 +89,7 @@ def gate(tmp_path):
         # admitted at all, and the suite runs while other agents load the Mac.
         env["HWGATE_FORCE_THERMAL"] = "0"
         env["HWGATE_FORCE_BACKUP"] = "0"
+        env["HWGATE_FORCE_BATTERY"] = "none"
         # Once the real helper is installed, every --stable test would spin the fans up.
         env["HWGATE_FAN_CMD"] = ""
         for key, value in extra.items():
@@ -711,6 +712,71 @@ def test_backups_are_read_from_tmutil(monkeypatch, reply, running):
     monkeypatch.setattr(module.subprocess, "run", fake_run)
     assert module.backup_running() is running
     assert calls == [["tmutil", "status", "-X"]]
+
+
+def test_a_low_battery_that_is_not_charging_refuses_at_once(gate):
+    # No --max-wait: a refusal must not turn into a wait.
+    result = gate("run", "--needs", "gpu", "--", "echo", "ran", HWGATE_FORCE_BATTERY="34,0")
+    assert result.returncode == 77 and "plugged in" in result.stderr, result.stderr
+    assert "ran" not in result.stdout
+
+
+@pytest.mark.parametrize("level, code", [("34", 75), ("40", 75), ("49", 75), ("50", 0)])
+def test_a_charging_battery_holds_jobs_until_50_percent_once_it_fell_below_35(gate, level, code):
+    assert gate("run", "--needs", "cpu", "--max-wait", "1", "--", "true", HWGATE_FORCE_BATTERY="34,1").returncode == 75
+    result = gate("run", "--needs", "cpu", "--max-wait", "1", "--", "true", HWGATE_FORCE_BATTERY=level + ",1")
+    assert result.returncode == code, result.stderr
+    assert ("charging; jobs wait for 50%" in result.stderr) is (code == 75)
+
+
+def test_a_battery_that_never_fell_below_35_holds_nothing_back(gate):
+    for reading in ("36,1", "36,0", "100,0"):
+        assert gate("run", "--needs", "cpu", "--max-wait", "1", "--", "true", HWGATE_FORCE_BATTERY=reading).returncode == 0
+
+
+def test_battery_recovery_ends_at_50_percent_and_unplugging_above_35_admits(gate):
+    run = lambda reading: gate("run", "--needs", "cpu", "--max-wait", "1", "--", "true",
+                               HWGATE_FORCE_BATTERY=reading).returncode
+    assert run("34,1") == 75
+    assert run("40,0") == 0
+    assert run("50,1") == 0
+    assert run("40,1") == 0
+
+
+@pytest.mark.parametrize("later, code", [("34,0", 77), ("50,1", 0)])
+def test_a_job_waiting_for_the_battery_follows_the_next_reading(gate, tmp_path, later, code):
+    reading = tmp_path / "battery"
+    reading.write_text("34,1")
+    proc = subprocess.Popen([sys.executable, str(HWGATE), "run", "--needs", "cpu", "--", "true"],
+                            env=gate.environ(HWGATE_FORCE_BATTERY=reading), stderr=subprocess.PIPE, text=True)
+    first = proc.stderr.readline()
+    assert "waiting: battery at 34% and charging" in first, first
+    # Replaced whole, so the waiter never reads a half-written file.
+    (tmp_path / "next").write_text(later)
+    os.replace(tmp_path / "next", reading)
+    _, err = proc.communicate(timeout=20)
+    assert proc.returncode == code, first + err
+
+
+def test_status_reports_the_battery(gate):
+    assert "battery: 80%, not charging" in gate("status", HWGATE_FORCE_BATTERY="80,0").stdout
+    assert "battery" not in gate("status").stdout
+    # Reporting a low reading must not start a recovery a job would then wait out.
+    assert "jobs wait for 50%" in gate("status", HWGATE_FORCE_BATTERY="34,1").stdout
+    assert gate("run", "--needs", "cpu", "--max-wait", "1", "--", "true", HWGATE_FORCE_BATTERY="40,1").returncode == 0
+
+
+@pytest.mark.parametrize("reply, reading", [
+    (plistlib.dumps([{"CurrentCapacity": 39, "MaxCapacity": 100, "IsCharging": True}]), (39.0, True)),
+    (plistlib.dumps([{"CurrentCapacity": 4000, "MaxCapacity": 5000, "IsCharging": False}]), (80.0, False)),
+    (b"", None),
+], ids=["percent", "mAh", "no-battery"])
+def test_the_battery_is_read_from_ioreg(monkeypatch, reply, reading):
+    module = load_hwgate()
+    monkeypatch.delenv("HWGATE_FORCE_BATTERY", raising=False)
+    monkeypatch.setattr(module.subprocess, "run",
+                        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=reply))
+    assert module.battery() == reading
 
 
 def test_frequencies_are_reported_against_the_hardware_maximum(gate):

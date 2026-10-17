@@ -12,6 +12,10 @@ Slot policy, decided by the macOS thermal state when a job asks to start:
   serious+  nothing new starts; after it clears, wait HWGATE_COOLDOWN seconds
 Running jobs are not stopped for heat: finishing costs less than restarting.
 
+Battery, on a Mac that has one: below BATTERY_MIN percent a new job is refused
+with exit 77 unless the battery is charging; a charging one makes every new job
+wait until it is back to BATTERY_RESUME. Running jobs are not stopped.
+
 Jobs share a slot: up to SLOT_PARALLEL of them hold one at a time, because work
 that is not being timed loses little to running alongside other work. --stable is
 what asks for the machine alone, and heat does the same thing for every job. A
@@ -82,7 +86,8 @@ Usage:
 
 Exit codes: the job's own code; 124 on timeout; 75 when --max-wait ran out
 before the job could start; 76 when a --stable job was aborted for
-throttling or a Time Machine backup; 2 on bad usage or a request larger than the machine's budget.
+throttling or a Time Machine backup; 77 when a low battery that is not
+charging refused the job; 2 on bad usage or a request larger than the machine's budget.
 """
 
 import argparse
@@ -112,6 +117,7 @@ THERMAL_NAMES = {0: "nominal", 1: "fair", 2: "serious", 3: "critical"}
 EXIT_TIMEOUT = 124
 EXIT_GAVE_UP = 75
 EXIT_UNSTABLE = 76
+EXIT_LOW_BATTERY = 77
 EXIT_USAGE = 2
 DEFAULT_TIMEOUT = 7200
 KILL_GRACE = 10.0
@@ -127,6 +133,9 @@ FAN_CMD = os.environ.get("HWGATE_FAN_CMD", "sudo -n /usr/local/libexec/hwgate-fa
 DEFAULT_THROTTLE_BUDGET = 10.0
 # Seconds between Time Machine checks during a --stable run; each one starts tmutil.
 BACKUP_POLL = 5.0
+# Battery percent below which a job is refused, and the level a charging battery must regain.
+BATTERY_MIN = 35.0
+BATTERY_RESUME = 50.0
 ADMIT_WAIT = 10.0
 # A wait whose reason has not changed is repeated this often, so a long one does not look hung.
 WAIT_REMINDER = 60.0
@@ -315,6 +324,55 @@ def backup_running():
         return bool(plistlib.loads(out).get("Running"))
     except Exception:
         return False
+
+
+def battery():
+    """(percent, charging) of the internal battery; None on a Mac without one, or when unreadable."""
+    forced = os.environ.get("HWGATE_FORCE_BATTERY")
+    if forced is not None:
+        # Tests pass "<percent>,<charging 0|1>" or "none", or a file path so the reading can change mid-wait.
+        if os.sep in forced:
+            with open(forced) as f:
+                forced = f.read().strip()
+        if forced == "none":
+            return None
+        level, charging = forced.split(",")
+        return float(level), charging == "1"
+    try:
+        out = subprocess.run(["ioreg", "-rn", "AppleSmartBattery", "-a"], capture_output=True, check=True,
+                             timeout=2).stdout
+        props = plistlib.loads(out)[0]
+        return 100.0 * props["CurrentCapacity"] / props["MaxCapacity"], bool(props.get("IsCharging"))
+    except Exception:
+        return None
+
+
+def battery_hold(reading, record=True):
+    """(why the battery keeps a new job from starting, whether it refuses rather than waits), or (None, False).
+
+    Below BATTERY_MIN a job is refused unless the battery is charging, and then it
+    waits until BATTERY_RESUME. The marker makes that recovery machine-wide, so a
+    job arriving midway cannot start ahead of one already waiting and slow the charge.
+    """
+    if reading is None:
+        return None, False
+    level, charging = reading
+    marker = os.path.join(STATE_DIR, "battery_low")
+    low = level < BATTERY_MIN
+    if record and low:
+        open(marker, "w").close()
+    elif record and level >= BATTERY_RESUME:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(marker)
+    if level >= BATTERY_RESUME or not (low or os.path.exists(marker)):
+        return None, False
+    if charging:
+        return "battery at {:.0f}% and charging; jobs wait for {:.0f}% after it fell below {:.0f}%".format(
+            level, BATTERY_RESUME, BATTERY_MIN), False
+    if low:
+        return "battery at {:.0f}% and not charging; jobs are refused below {:.0f}% until the Mac is plugged in".format(
+            level, BATTERY_MIN), True
+    return None, False
 
 
 def dvfs_tables():
@@ -981,8 +1039,12 @@ def acquire(requested, want, held, max_wait, stable):
     barriers = {}
     try:
         while True:
+            hold, refused = battery_hold(battery())
+            if refused:
+                log("refused, nothing was started: " + hold)
+                sys.exit(EXIT_LOW_BATTERY)
             state, cooldown, warm_cooldown = read_thermal()
-            reason = too_hot_to_start(state, cooldown, warm_cooldown, stable)
+            reason = hold or too_hot_to_start(state, cooldown, warm_cooldown, stable)
             if reason is None and stable and backup_running():
                 reason = "a Time Machine backup is running; --stable waits for it to finish"
             if reason is not None:
@@ -1289,6 +1351,10 @@ def cmd_status(_args):
     print(line)
     if backup_running():
         print("time machine: backing up; --stable waits for it to finish")
+    reading = battery()
+    if reading:
+        hold, _ = battery_hold(reading, record=False)
+        print(hold or "battery: {:.0f}%, {}".format(reading[0], "charging" if reading[1] else "not charging"))
     ceilings = freq_ceilings()
     if ceilings:
         print("hardware max: " + ", ".join("{} {:.0f} MHz".format(s, ceilings[s]) for s in sorted(ceilings)))

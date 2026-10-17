@@ -60,6 +60,7 @@ A `--stable` run over 10 minutes says so when it exits, as a reminder to split i
 - **`--cpus <n>`** charges `n` of the core budget (the 12 performance cores, or `HWGATE_CPU_BUDGET`) and exports `HWGATE_CPUS` and `OMP_NUM_THREADS` and friends. Pass the same `n` to `pytest -n`, not `auto`. A job that declares nothing is charged a third of the budget.
 - **There is no memory flag.** GPU memory here is wired and can't be swapped, so a job past it fails rather than slowing down. Size large models yourself, and use `--stable` to have the GPU to yourself.
 - **Heat:** at fair, one heavy job at a time. At serious or worse, nothing new starts until 60s after it clears. Running jobs are never stopped for heat.
+- **Battery:** below 35%, a new job is refused with exit 77 unless the Mac is charging; while charging, new jobs wait until it is back to 50%. Running jobs are never stopped.
 - **Timeout:** `--timeout` (default 7200s) kills the job's whole process group, as does the job exiting. `--timeout 0` disables the timeout and the cleanup.
 - **Nesting:** a gated job that calls `hwgate` again reuses its own slots.
 
@@ -71,6 +72,7 @@ A `--stable` run over 10 minutes says so when it exits, as a reminder to split i
 |---|---|---|
 | the job's own | the job ran | read its output |
 | 75 | `--max-wait` ran out; nothing started | check `hwgate status`, retry later |
+| 77 | battery below 35% and not charging; nothing started | don't retry in a loop; tell the user the Mac needs power |
 | 124 | the job hit `--timeout` | it hung, or needs a longer `--timeout` |
 | 2 | bad usage, `--cpus` over the budget, or nested `--stable` | fix the request |
 | 76 | `--stable` job aborted for throttling, for staying below `--min-freq-ratio`, or for a Time Machine backup | discard partial numbers and rerun later; it waits for the cooldown or backup itself |
@@ -81,6 +83,6 @@ A `--stable` run over 10 minutes says so when it exits, as a reminder to split i
 
 - Never run gated work outside `hwgate` because the slot is busy. Wait or retry.
 - Never under-declare `--cpus`; nothing enforces it, so a wrong number oversubscribes the machine for everyone.
-- Never set `HWGATE_FORCE_THERMAL`, `HWGATE_FORCE_BACKUP` or `HWGATE_STATE_DIR` outside hwgate's own tests.
+- Never set `HWGATE_FORCE_THERMAL`, `HWGATE_FORCE_BACKUP`, `HWGATE_FORCE_BATTERY` or `HWGATE_STATE_DIR` outside hwgate's own tests.
 - Don't wrap commands that leave a background process behind (`sh -c 'server &'`): it is killed when the job returns.
 - Kill only your own job, by the pid from `hwgate status`. Don't delete lock files.
