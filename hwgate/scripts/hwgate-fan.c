@@ -102,6 +102,9 @@ static void mode_key(char *out, int fan) {
     if (key_info(out, &info)) fan_key(out, fan, "md");
 }
 
+// Apple Silicon SMCs also report automatic as 3, seen with the fans spun down.
+static int is_auto(int mode) { return mode == 0 || mode == 3; }
+
 static int status(void) {
     int n = fan_count(), unlock = -1;
     read_u8("Ftst", &unlock);
@@ -116,7 +119,7 @@ static int status(void) {
         fan_key(k, i, "Tg"); read_float(k, &target);
         mode_key(k, i); read_u8(k, &mode);
         printf("fan %d: %.0f rpm (min %.0f, max %.0f, target %.0f), %s\n", i, actual, minimum, maximum,
-               target, mode == 1 ? "manual" : mode == 0 ? "auto" : "mode unknown");
+               target, mode == 1 ? "manual" : is_auto(mode) ? "auto" : "mode unknown");
     }
     return n > 0 ? 0 : 1;
 }
@@ -149,7 +152,7 @@ static int settled(int n, int manual) {
         char k[5];
         float maximum, target;
         mode_key(k, i);
-        if (read_u8(k, &mode) || mode != manual) return 0;
+        if (read_u8(k, &mode) || (manual ? mode != 1 : !is_auto(mode))) return 0;
         fan_key(k, i, "Mx");
         if (manual && read_float(k, &maximum)) return 0;
         fan_key(k, i, "Tg");
