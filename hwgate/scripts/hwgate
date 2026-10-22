@@ -605,8 +605,8 @@ def fan_helper_installed():
 def run_fans(mode):
     """The fan helper's output for one mode; OSError says why it failed."""
     try:
-        # A call takes up to 20s (a failed max then hands the fans back) and may first wait for an earlier one.
-        result = subprocess.run(FAN_CMD + [mode], capture_output=True, text=True, timeout=60)
+        # A call takes up to 40s (a failed max then hands the fans back) and may first wait for an earlier one.
+        result = subprocess.run(FAN_CMD + [mode], capture_output=True, text=True, timeout=90)
     except subprocess.TimeoutExpired:
         raise OSError("timed out")
     if result.returncode:

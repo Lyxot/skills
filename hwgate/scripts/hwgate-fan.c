@@ -163,17 +163,18 @@ static int settled(int n, int manual) {
 
 // The SMC applies writes up to ~0.8s after accepting them, so return only once the state has held
 // for longer than that: otherwise writes still pending from an earlier, possibly killed, call can
-// land after this one returns and undo it.
+// land after this one returns and undo it. Stopped fans (mode 3) take ~10s to spin up through
+// automatic before the SMC accepts manual, so max gets 30s.
 static int set_mode(int manual) {
-    int n = fan_count(), held = 0;
+    int n = fan_count(), held = 0, ticks = manual ? 300 : 100;
     if (!n) return fprintf(stderr, "hwgate-fan: no fans\n"), 1;
-    for (int tick = 0; tick < 100; tick++) {
+    for (int tick = 0; tick < ticks; tick++) {
         if (!held && tick % 10 == 0) request(n, manual);  // re-issued each second until it holds
         usleep(100000);
         held = settled(n, manual) ? held + 1 : 0;
         if (held >= 15) return 0;
     }
-    fprintf(stderr, "hwgate-fan: fans did not hold %s for 1.5s within 10s\n", manual ? "max" : "auto");
+    fprintf(stderr, "hwgate-fan: fans did not hold %s for 1.5s within %ds\n", manual ? "max" : "auto", ticks / 10);
     // A partial pin is handed back rather than left for the whole run.
     if (manual) set_mode(0);
     return 1;
