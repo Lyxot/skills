@@ -646,6 +646,149 @@ def test_stable_refuses_to_run_inside_any_gated_job(gate, parent):
     assert "measured" not in result.stdout
 
 
+def overrides(tmp_path):
+    path = tmp_path / "state" / "overrides.log"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_a_user_override_kills_the_holder_runs_at_once_and_is_recorded(gate, tmp_path):
+    holder = gate.background("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sleep", "60")
+    result = gate("run", "--needs", "gpu", "--max-wait", "20", "--user-override", "run my eval now", "--",
+                  "echo", "ran")
+    assert result.returncode == 0 and "ran" in result.stdout, result.stderr
+    _, err = holder.communicate(timeout=20)
+    assert holder.returncode == 78 and "run my eval now" in err, err
+    assert "stable run:" not in err
+    events = overrides(tmp_path)
+    assert [e["event"] for e in events] == ["override", "killed"]
+    assert all(e["instruction"] == "run my eval now" for e in events)
+    assert "sleep 60" in events[1]["victim"]
+
+
+# Fair heat must not widen the takeover to the cpu slot, whose holder it was never asked to kill.
+@pytest.mark.parametrize("thermal", [0, 1], ids=["nominal", "fair"])
+def test_a_user_override_leaves_jobs_on_other_slots_running(gate, thermal):
+    holder = gate.background("run", "--needs", "cpu", "--", "sleep", "60")
+    result = gate("run", "--needs", "gpu", "--max-wait", "20", "--user-override", "use the gpu", "--", "echo", "ran",
+                  HWGATE_FORCE_THERMAL=thermal)
+    assert result.returncode == 0 and "ran" in result.stdout, result.stderr
+    assert holder.poll() is None
+
+
+def test_a_user_override_starts_past_heat_and_battery(gate):
+    holder = gate.background("run", "--needs", "gpu", "--", "sleep", "60")
+    result = gate("run", "--needs", "gpu", "--max-wait", "20", "--user-override", "now", "--", "echo", "ran",
+                  HWGATE_FORCE_THERMAL=2, HWGATE_FORCE_BATTERY="34,0")
+    assert result.returncode == 0 and "ran" in result.stdout, result.stderr
+    assert holder.wait(timeout=20) == 78
+
+
+def test_a_user_override_keeps_its_slot_to_itself(gate):
+    gate.background("run", "--needs", "gpu", "--user-override", "mine", "--", "sleep", "60")
+    assert gate("run", "--needs", "gpu", "--max-wait", "1", "--", "true").returncode == 75
+
+
+def job_pid(gate):
+    """The pid of the one job holding a lease."""
+    (lease,) = [json.loads(p.read_text()) for p in gate.leases.glob("*.json")]
+    return lease["child_pid"]
+
+
+def wait_for_exit(pid, deadline=10.0):
+    until = time.time() + deadline
+    while time.time() < until:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    raise AssertionError("pid {} never exited".format(pid))
+
+
+def test_a_victim_still_cleaning_up_is_killed_and_recorded_once(gate, tmp_path):
+    # Its fans take 4s to hand back, so the override retries while its lease is still live.
+    helper, _ = fake_fan_helper(tmp_path, block=("auto",), block_seconds=4)
+    holder = gate.background("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sleep", "60",
+                             HWGATE_FAN_CMD=helper)
+    result = gate("run", "--needs", "gpu", "--max-wait", "20", "--user-override", "now", "--", "echo", "ran")
+    assert result.returncode == 0 and "ran" in result.stdout, result.stderr
+    assert result.stderr.count("--user-override: killing") == 1, result.stderr
+    assert [e["event"] for e in overrides(tmp_path)] == ["override", "killed"]
+    assert holder.wait(timeout=20) == 78
+
+
+def test_a_victim_whose_wrapper_is_stopped_is_killed_once(gate, tmp_path):
+    """A stopped wrapper never reaps its killed job, which then still looks alive to every retry."""
+    holder = gate.background("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sleep", "60")
+    holder.send_signal(signal.SIGSTOP)
+    try:
+        # Past the first attempt's 10s grace for the unreaped job, so later attempts see it too.
+        result = gate("run", "--needs", "gpu", "--max-wait", "14", "--user-override", "now", "--", "true")
+        assert result.returncode == 75, result.stderr
+        assert result.stderr.count("--user-override: killing") == 1, result.stderr
+        assert [e["event"] for e in overrides(tmp_path)] == ["override", "killed"]
+    finally:
+        holder.send_signal(signal.SIGCONT)
+    assert holder.wait(timeout=20) == 78
+
+
+def test_a_user_override_clears_a_job_stranded_by_a_killed_wrapper(gate, tmp_path):
+    wrapper = gate.background("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sh", "-c",
+                              "sleep 45 & sleep 1")
+    pid = job_pid(gate)
+    wrapper.kill()
+    wrapper.wait()
+    wait_for_exit(pid)  # its main process has exited; the background sleep still holds the slot
+    assert gate("run", "--needs", "gpu", "--max-wait", "1", "--", "true").returncode == 75
+    result = gate("run", "--needs", "gpu", "--max-wait", "20", "--user-override", "now", "--", "echo", "ran")
+    assert result.returncode == 0 and "ran" in result.stdout, result.stderr
+    assert [e["event"] for e in overrides(tmp_path)] == ["override", "killed"]
+
+
+def test_a_user_override_never_kills_a_process_that_reused_a_holders_pid(gate, tmp_path):
+    bystander = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    gate.leases.mkdir(parents=True, exist_ok=True)
+    lease = gate.leases / "planted.json"
+    # A live lease whose job's pid now belongs to an unrelated process: the start times differ.
+    lease.write_text(json.dumps({"cpus": 0, "slots": ["gpu"], "shared": [], "wrapper_pid": bystander.pid,
+                                 "child_pid": bystander.pid, "pgid": bystander.pid,
+                                 "child_start": "Thu Jan  1 00:00:00 1970", "cmd": "the original job"}))
+    holder = hold_lease(lease)
+    try:
+        result = gate("run", "--needs", "gpu", "--user-override", "now", "--", "true")
+        assert result.returncode == 0, result.stderr
+        assert bystander.poll() is None
+        assert [e["event"] for e in overrides(tmp_path)] == ["override"]
+    finally:
+        bystander.kill()
+        holder.kill()
+
+
+def test_a_job_that_already_finished_is_not_reported_killed(gate, tmp_path):
+    helper, _ = fake_fan_helper(tmp_path, block=("auto",), block_seconds=4)
+    holder = gate.background("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "true",
+                             HWGATE_FAN_CMD=helper)
+    wait_for_exit(job_pid(gate))  # its wrapper is still handing the fans back
+    result = gate("run", "--needs", "gpu", "--max-wait", "20", "--user-override", "now", "--", "echo", "ran")
+    assert result.returncode == 0 and "ran" in result.stdout, result.stderr
+    assert holder.wait(timeout=20) == 0
+    assert [e["event"] for e in overrides(tmp_path)] == ["override"]
+
+
+@pytest.mark.parametrize("instruction", ["", "   "])
+def test_a_user_override_needs_the_instruction(gate, instruction):
+    result = gate("run", "--needs", "gpu", "--user-override", instruction, "--", "echo", "ran")
+    assert result.returncode == 2 and "quoted verbatim" in result.stderr, result.stderr
+    assert "ran" not in result.stdout
+
+
+def test_a_user_override_refuses_to_kill_the_job_it_runs_in(gate):
+    result = gate("run", "--needs", "cpu", "--max-wait", "3", "--", sys.executable, str(HWGATE),
+                  "run", "--needs", "gpu", "--user-override", "now", "--", "echo", "ran")
+    assert result.returncode == 2 and "cannot run inside another gated job" in result.stderr
+    assert "ran" not in result.stdout
+
+
 def test_stable_runs_normally_when_nothing_encloses_it(gate):
     """The refusal must not reach a --stable job that is nobody's child."""
     result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "echo", "measured",
@@ -882,7 +1025,7 @@ with open({calls!r}, "a") as f:
 if mode in {fail!r}:
     sys.exit("no SMC")
 if mode in {block!r}:
-    time.sleep(30)
+    time.sleep({block_seconds})
 if mode == "status":
     print("fans 2, Ftst unlock off")
     print({status!r})
@@ -901,12 +1044,12 @@ def test_a_long_stable_run_is_told_to_give_each_case_its_own_run(gate, flags, se
     assert ("its own --stable run" in result.stderr) is hinted, result.stderr
 
 
-def fake_fan_helper(tmp_path, fail=(), block=(), status=""):
+def fake_fan_helper(tmp_path, fail=(), block=(), status="", block_seconds=30):
     """A helper recording the modes it is run with; it fails those in `fail` and hangs in those in `block`."""
     calls = tmp_path / "fan_calls"
     helper = tmp_path / "hwgate-fan"
     helper.write_text(FAN_HELPER.format(python=sys.executable, calls=str(calls), fail=list(fail),
-                                        block=list(block), status=status))
+                                        block=list(block), status=status, block_seconds=block_seconds))
     helper.chmod(0o755)
     return helper, calls
 

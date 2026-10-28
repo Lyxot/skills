@@ -16,6 +16,15 @@ Battery, on a Mac that has one: below BATTERY_MIN percent a new job is refused
 with exit 77 unless the battery is charging; a charging one makes every new job
 wait until it is back to BATTERY_RESUME. Running jobs are not stopped.
 
+--user-override INSTRUCTION is the user's way past all of this, and only the
+user's: an agent passes it only when the user explicitly told it to take the
+machine for that job, with their words verbatim; a standing permission does not
+count. It kills every job holding a slot the new job needs (each killed
+job exits 78, quoting the instruction), then starts the new job with those slots
+to itself, past every heat, battery and queue check; a --stable one is still
+watched for throttling once it runs. Each use is appended to overrides.log in
+the state dir.
+
 Jobs share a slot: up to SLOT_PARALLEL of them hold one at a time, because work
 that is not being timed loses little to running alongside other work. --stable is
 what asks for the machine alone, and heat does the same thing for every job. A
@@ -87,7 +96,7 @@ Usage:
 Exit codes: the job's own code; 124 on timeout; 75 when --max-wait ran out
 before the job could start; 76 when a --stable job was aborted for
 throttling or a Time Machine backup; 77 when a low battery that is not
-charging refused the job; 2 on bad usage or a request larger than the machine's budget.
+charging refused the job; 78 when a --user-override killed the job; 2 on bad usage or a request larger than the machine's budget.
 """
 
 import argparse
@@ -118,6 +127,9 @@ EXIT_TIMEOUT = 124
 EXIT_GAVE_UP = 75
 EXIT_UNSTABLE = 76
 EXIT_LOW_BATTERY = 77
+EXIT_PREEMPTED = 78
+# Next to a lease: the instruction of the --user-override that killed its job.
+PREEMPTED = ".preempted"
 EXIT_USAGE = 2
 DEFAULT_TIMEOUT = 7200
 KILL_GRACE = 10.0
@@ -757,9 +769,13 @@ def scan_leases(reap=False):
     except OSError:
         return leases
     for name in names:
+        path = os.path.join(STATE_DIR, "leases", name)
+        # A marker written as its victim's wrapper finished has no lease left to be cleaned up with.
+        if name.endswith(PREEMPTED) and not os.path.exists(path[:-len(PREEMPTED)]):
+            with contextlib.suppress(OSError):
+                os.remove(path)
         if not name.endswith(".json"):
             continue
-        path = os.path.join(STATE_DIR, "leases", name)
         try:
             fd = os.open(path, os.O_RDWR)
         except OSError:
@@ -769,10 +785,11 @@ def scan_leases(reap=False):
         if not finished:
             leases.append(read_lease(path))
             continue
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        for leftover in (path, path + PREEMPTED):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
     if reap:
         for lease in leases:
             reap_abandoned(lease, "job holding a budget lease")
@@ -953,7 +970,59 @@ def inside_gated_job(leases):
     return os.getpgrp() in {lease.get("pgid") for lease in leases}
 
 
-def try_admit(requested, want, held, state, stable, barriers):
+def audit(record):
+    """Append one --user-override event to overrides.log, the record of who took the machine and why."""
+    record["time"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        with open(os.path.join(STATE_DIR, "overrides.log"), "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as e:
+        log("cannot record this --user-override ({})".format(e))
+
+
+def preempt(slots, instruction, handled):
+    """Kill every job holding one of these slots, telling its wrapper why, and give each KILL_GRACE to exit.
+
+    A victim's lease stays live while its wrapper cleans up, so `handled` remembers whom
+    earlier attempts dealt with: each job is killed and recorded once, and a pgid it
+    left behind is never signalled again after the system has reused it.
+    """
+    with admit_lock(timeout=1.0) as locked:
+        leases = scan_leases() if locked else []
+    victims = []
+    for lease in leases:
+        if lease["path"] in handled or not set(lease["slots"]) & slots or not isinstance(lease.get("pgid"), int):
+            continue
+        if pid_alive(lease["child_pid"]):
+            # Unless its pid now names another process; a start ps cannot give now is asked again next attempt.
+            started, recorded = process_start(lease["child_pid"]), lease.get("child_start")
+            ours = started is not None and recorded in (started, None)
+        else:
+            # A job that exited is finished off by its live wrapper. Without one, a live group can
+            # only be the job's leftovers still holding the slot: no other group can take the id
+            # of a leader that is gone while members remain.
+            ours = not pid_alive(lease["wrapper_pid"]) and group_alive(lease["pgid"])
+        if ours:
+            handled.add(lease["path"])
+            victims.append(lease)
+    for lease in victims:
+        try:
+            with open(lease["path"] + PREEMPTED, "w") as f:
+                f.write(instruction)
+        except OSError:
+            pass
+        log("--user-override: killing {}".format(describe_holder(lease)))
+        audit({"event": "killed", "pid": os.getpid(), "instruction": instruction, "victim": lease.get("cmd", "?"),
+               "victim_pid": lease.get("child_pid"), "victim_cwd": lease.get("cwd")})
+        kill_group(lease["pgid"], signal.SIGTERM)
+    deadline = time.time() + KILL_GRACE
+    while time.time() < deadline and any(pid_alive(lease["child_pid"]) for lease in victims):
+        time.sleep(0.1)
+    for lease in victims:
+        kill_group(lease["pgid"], signal.SIGKILL)
+
+
+def try_admit(requested, want, held, state, stable, barriers, override=False):
     """One attempt. Returns (slot fds, (lease fd, path), shared slots, refusal).
 
     Every refusal leaves through refuse(), so no path can keep a barrier it is no
@@ -961,10 +1030,11 @@ def try_admit(requested, want, held, state, stable, barriers):
     """
     # Heat and --stable collapse every slot to exclusive, which only works for a job
     # that acquires; one that inherits its slots never gets here, so --stable refuses
-    # to run inside another job at all.
-    alone = stable or state >= FAIR
+    # to run inside another job at all. An override takes what it needs whole, and
+    # heat does not widen that to slots whose holders it was never asked to kill.
+    alone = stable or (state >= FAIR and not override)
     need = (set(SLOTS) if alone else set(requested)) - held
-    share = set() if alone else set(need)
+    share = set() if alone or override else set(need)
 
     def refuse(reason, blocking=frozenset(), fds=()):
         sync_barriers(barriers, set(blocking))
@@ -980,11 +1050,11 @@ def try_admit(requested, want, held, state, stable, barriers):
         # A job taking the cpu slot whole is answered by the lock below, never the budget:
         # only a lock refusal raises its barrier, and without one sharers declaring cores
         # could keep it out for as long as they kept arriving.
-        takes_cpu_whole = alone and "cpu" not in held
+        takes_cpu_whole = "cpu" in need and "cpu" not in share
         if want and not takes_cpu_whole and used_cpus + want > cpu_budget():
             return refuse("cpu budget: {} of {} cores declared, this job needs {}{}".format(
                 used_cpus, cpu_budget(), want, holder_summary("cpu", leases)))
-        for slot in sorted(need if not alone else ()):
+        for slot in sorted(share):
             taken = slot_occupants(slot, leases)
             if taken >= SLOT_PARALLEL:
                 return refuse("{} slot is full: {} of {} jobs{}".format(
@@ -1032,28 +1102,33 @@ def too_hot_to_start(state, cooldown, warm_cooldown, stable):
     return None
 
 
-def acquire(requested, want, held, max_wait, stable):
+def acquire(requested, want, held, max_wait, stable, override=None):
     start = time.time()
     delay = 1.0
     last_key, last_logged = None, 0.0
-    barriers = {}
+    barriers, handled = {}, set()
     try:
         while True:
-            hold, refused = battery_hold(battery())
-            if refused:
-                log("refused, nothing was started: " + hold)
-                sys.exit(EXIT_LOW_BATTERY)
-            state, cooldown, warm_cooldown = read_thermal()
-            reason = hold or too_hot_to_start(state, cooldown, warm_cooldown, stable)
-            if reason is None and stable and backup_running():
-                reason = "a Time Machine backup is running; --stable waits for it to finish"
+            if override:
+                # Each attempt, since a job can take the slot while the killed one is exiting.
+                preempt((set(SLOTS) if stable else set(requested)) - held, override, handled)
+                state, reason = read_thermal()[0], None
+            else:
+                hold, refused = battery_hold(battery())
+                if refused:
+                    log("refused, nothing was started: " + hold)
+                    sys.exit(EXIT_LOW_BATTERY)
+                state, cooldown, warm_cooldown = read_thermal()
+                reason = hold or too_hot_to_start(state, cooldown, warm_cooldown, stable)
+                if reason is None and stable and backup_running():
+                    reason = "a Time Machine backup is running; --stable waits for it to finish"
             if reason is not None:
                 # Held up by heat rather than by a sharer, so nothing is owed a
                 # barrier; try_admit keeps its own.
                 sync_barriers(barriers, set())
             else:
                 fds, lease_fd, share, reason = try_admit(
-                    requested, want, held, state, stable, barriers)
+                    requested, want, held, state, stable, barriers, override=bool(override))
                 if reason is None:
                     return fds, lease_fd, share, state
             # Reasons carry running counters ("held ... for 668s"), which change every poll.
@@ -1219,6 +1294,19 @@ def cmd_run(args):
             " holds, hold out for nominal heat, or watch for throttling, so its numbers would be"
             " measured under conditions it never established. Run it outside that job")
         return EXIT_USAGE
+    override = args.user_override
+    if override is not None:
+        if not override.strip():
+            log("--user-override takes the user's instruction, quoted verbatim")
+            return EXIT_USAGE
+        if inside_another_job(held):
+            log("--user-override cannot run inside another gated job, which it could end up killing; run it on its own")
+            return EXIT_USAGE
+        log("--user-override: on the user's instruction {!r}, killing whatever holds {} and starting now,"
+            " past every heat, battery and queue check".format(
+                override, ", ".join(sorted(set(SLOTS) if args.stable else needs))))
+        audit({"event": "override", "pid": os.getpid(), "instruction": override,
+               "cmd": " ".join(command)[:500], "cwd": os.getcwd()})
     if needs <= held:
         extra = max(0, want - held_cpus)
         env = declared_env(dict(os.environ), args)
@@ -1236,7 +1324,7 @@ def cmd_run(args):
         os.execvpe(command[0], command, env)
     want = max(0, want - held_cpus)
 
-    fds, lease, share, state = acquire(needs, want, held, args.max_wait, args.stable)
+    fds, lease, share, state = acquire(needs, want, held, args.max_wait, args.stable, override)
     if fds is None:
         log("gave up after waiting {}s; nothing was started".format(args.max_wait))
         return EXIT_GAVE_UP
@@ -1316,7 +1404,16 @@ def cmd_run(args):
                 terminate(proc)
                 rc = EXIT_UNSTABLE
                 break
-        if watch and rc != EXIT_UNSTABLE:
+        try:
+            with open(lease_file + PREEMPTED) as f:
+                said = f.read()
+        except OSError:
+            said = None
+        if said is not None:
+            log("KILLED by a --user-override: the user asked for this machine ({!r}). Treat partial results as"
+                " invalid; a rerun waits behind that job.".format(said))
+            rc = EXIT_PREEMPTED
+        if watch and rc not in (EXIT_UNSTABLE, EXIT_PREEMPTED):
             log("--stable run: " + watch.summary())
             for line in watch.advice():
                 log(line)
@@ -1332,10 +1429,11 @@ def cmd_run(args):
         release_fans()
         for slot in set(fds) - share:
             remove_info(slot)
-        try:
-            os.remove(lease_file)
-        except OSError:
-            pass
+        for leftover in (lease_file, lease_file + PREEMPTED):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
         for fd in list(fds.values()) + [lease_fd]:
             os.close(fd)
     return 128 - rc if rc < 0 else rc
@@ -1431,6 +1529,7 @@ def main():
     run.add_argument("--stable", action="store_true", help="needs stable performance: start alone at nominal after a cooldown and with no Time Machine backup running, abort with 76 once throttled or a backup starts")
     run.add_argument("--throttle-budget", type=float, default=DEFAULT_THROTTLE_BUDGET, help="--stable: seconds of continuous throttling (heat plus a frequency drop) tolerated before aborting (default %(default)s)")
     run.add_argument("--min-freq-ratio", type=float, help="--stable: also abort with 76 once a busy unit stays below this fraction of its hardware maximum frequency for longer than --throttle-budget, whatever the heat (e.g. 0.85)")
+    run.add_argument("--user-override", metavar="INSTRUCTION", help="ONLY when the user explicitly told you to take the machine for this job, never on your own judgement or a standing permission: their instruction, quoted verbatim. Kills every job holding the slots this job needs (--cpus counts as needing the cpu slot; killed jobs exit 78) and starts it at once with those slots to itself, past every heat, battery and queue check (a --stable one can still exit 76 once running). Logged to overrides.log")
     run.add_argument("command", nargs=argparse.REMAINDER)
     sub.add_parser("status", help="show thermal state and who holds each slot")
     args = parser.parse_args()
