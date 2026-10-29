@@ -4,6 +4,7 @@ Each test gets its own HWGATE_STATE_DIR and a small core budget, so nothing here
 touches the machine's real slots.
 """
 
+import errno
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -533,12 +534,162 @@ def test_admission_never_hands_out_more_than_the_budget(gate):
 
 def test_status_reports_the_budget_and_the_sharers(gate):
     assert "budget: 0/8 cores declared" in gate("status").stdout
-    gate.background("run", "--needs", "gpu,cpu", "--cpus", "5", "--", "sleep", "20")
+    job = gate.background("run", "--needs", "gpu,cpu", "--cpus", "5", "--", "sleep", "20")
     status = gate("status").stdout
     assert "budget: 5/8 cores declared" in status
-    assert "cpu: 1 of 3 jobs" in status
-    assert "gpu: 1 of 3 jobs" in status
-    assert status.count("5 cores, pid ") == 2
+    pid = [json.loads(p.read_text()) for p in gate.leases.glob("*.json")][0]["child_pid"]
+    for slot in ("gpu", "cpu"):
+        assert "{}: 1 of 3 jobs (job {})".format(slot, pid) in status, status
+    # One entry for the job, however many slots it shares.
+    assert status.count("job {}: shares gpu+cpu, 5 cores".format(pid)) == 1, status
+    assert "    sleep 20\n" in status
+
+
+def test_status_lists_a_job_once_and_fits_its_command_to_a_line(gate):
+    args = ["--arg{}={}".format(i, "x" * 20) for i in range(12)]
+    gate.background("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--",
+                    sys.executable, "-c", "import time; time.sleep(30)", *args)
+    status = gate("status").stdout
+    pid = [json.loads(p.read_text()) for p in gate.leases.glob("*.json")][0]["child_pid"]
+    assert "gpu: busy (job {})".format(pid) in status and "cpu: busy (job {})".format(pid) in status, status
+    assert status.count("job {}: --stable, holds gpu+cpu".format(pid)) == 1, status
+    command = next(line for line in status.splitlines() if "time.sleep(30)" in line)
+    cut = re.search(r"^ +(.*) … \(\+(\d+) words\)$", command)
+    assert len(command) <= 160 and cut, command
+    full = next(line for line in gate("status", "--full").stdout.splitlines() if "time.sleep(30)" in line)
+    assert full.endswith(" ".join(args)), full
+    # What is shown plus what is counted is the whole command.
+    assert len(cut.group(1).split(" ")) + int(cut.group(2)) == len(full.strip().split(" ")), (command, full)
+    assert "\033[" not in status
+
+
+@pytest.mark.parametrize("case", ["multiline", "long-first-word"])
+def test_status_keeps_every_command_on_one_bounded_line(gate, tmp_path, case):
+    if case == "multiline":
+        command = [sys.executable, "-c", "import time\ntime.sleep(30)"]
+    else:
+        python = tmp_path / ("p" * 200)
+        python.symlink_to(sys.executable)
+        command = [str(python), "-c", "import time; time.sleep(30)", "a", "b"]
+    gate.background("run", "--needs", "gpu", "--", *command)
+    lines = gate("status").stdout.splitlines()
+    job = next(i for i, line in enumerate(lines) if line.startswith("job "))
+    assert lines[job + 2].startswith("    in "), lines
+    assert len(lines[job + 1]) <= 160, lines[job + 1]
+
+
+def test_status_full_shows_a_command_past_500_characters(gate):
+    tail = "--end-" + "y" * 600
+    gate.background("run", "--needs", "gpu", "--", sys.executable, "-c", "import time; time.sleep(30)", tail)
+    assert tail + "\n" in gate("status", "--full").stdout
+
+
+def wait_for_status(gate, text, deadline=15.0):
+    until = time.time() + deadline
+    while time.time() < until:
+        status = gate("status").stdout
+        if text in status:
+            return status
+        time.sleep(0.1)
+    raise AssertionError("status never showed {!r}:\n{}".format(text, status))
+
+
+def test_status_lists_waiting_jobs_by_arrival_and_tags_whole_slot_takers(gate):
+    for _ in range(3):
+        gate.background("run", "--needs", "gpu", "--", "sleep", "30")
+
+    def wait_in_line(*args):
+        return subprocess.Popen([sys.executable, str(HWGATE), "run", "--needs", "gpu", *args],
+                                env=gate.environ(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    older = wait_in_line("--max-wait", "30", "--", "echo", "older")
+    wait_for_status(gate, "queue: 1 waiting")
+    whole = wait_in_line("--stable", "--max-wait", "30", "--", "echo", "whole")
+    status = wait_for_status(gate, "queue: 2 waiting, by arrival; there is no fixed order")
+    try:
+        lines = status.splitlines()
+        first = next(i for i, line in enumerate(lines) if line.startswith("  pid {}:".format(older.pid)))
+        second = next(i for i, line in enumerate(lines) if line.startswith("  pid {}:".format(whole.pid)))
+        assert first < second, status
+        assert "needs gpu, waiting" in lines[first] and "whole slot" not in lines[first], status
+        assert "slot is full" in lines[first + 1] and lines[first + 2].strip() == "echo older", status
+        assert "--stable, needs gpu+cpu" in lines[second], status
+        assert "waiting for a whole slot, so new sharers hold back" in lines[second], status
+    finally:
+        for proc in (older, whole):
+            proc.kill()
+            proc.wait()
+    # A waiter that is gone leaves the queue, however it went.
+    assert "queue:" not in gate("status").stdout
+
+
+def test_status_shows_every_slot_of_a_holder_known_only_from_its_info_files(gate, tmp_path):
+    """A version without leases left only info files; its job is still listed once, with both slots."""
+    state = tmp_path / "state"
+    gate("status")
+    info = {"wrapper_pid": os.getpid(), "child_pid": 4242, "pgid": 4242, "cmd": "old bench", "cwd": "/",
+            "slots": ["gpu", "cpu"], "stable": True, "started": time.time()}
+    for slot in ("gpu", "cpu"):
+        (state / (slot + ".json")).write_text(json.dumps(info))
+    holder = subprocess.Popen([sys.executable, "-c", "import fcntl,sys,time\n"
+                               "fs=[open(p,'a') for p in sys.argv[1:]]\n"
+                               "[fcntl.flock(f, fcntl.LOCK_EX) for f in fs]\nprint(flush=True)\ntime.sleep(30)",
+                               str(state / "gpu.lock"), str(state / "cpu.lock")], stdout=subprocess.PIPE, text=True)
+    try:
+        holder.stdout.readline()
+        status = gate("status").stdout
+        assert "gpu: busy (job 4242)" in status and "cpu: busy (job 4242)" in status, status
+        assert status.count("job 4242: --stable, holds gpu+cpu") == 1, status
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_a_queue_entry_that_cannot_be_written_leaves_nothing_behind(monkeypatch, tmp_path):
+    module = load_hwgate()
+    monkeypatch.setattr(module, "STATE_DIR", str(tmp_path))
+    (tmp_path / "queue").mkdir()
+    before = len(os.listdir("/dev/fd"))
+
+    def full(fd, text):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(module, "write_text", full)
+    with pytest.raises(OSError):
+        module.queue_entry({"pid": os.getpid()})
+    assert os.listdir(tmp_path / "queue") == []
+    assert len(os.listdir("/dev/fd")) == before
+
+
+def test_status_shows_what_heat_makes_a_waiter_need_and_tags_only_barrier_holders(gate):
+    """At fair heat every job takes both slots; a --stable job held back by heat holds no barrier."""
+    gate.background("run", "--needs", "cpu", "--cpus", "1", "--", "sleep", "30")
+    waiters = [subprocess.Popen([sys.executable, str(HWGATE), "run", "--needs", "gpu", *args, "--max-wait", "30",
+                                 "--", "true"], env=gate.environ(HWGATE_FORCE_THERMAL=1),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+               for args in ([], ["--stable"])]
+    try:
+        lines = wait_for_status(gate, "queue: 2 waiting").splitlines()
+        plain, stable = (next(line for line in lines if line.startswith("  pid {}:".format(w.pid))) for w in waiters)
+        assert "needs gpu+cpu" in plain and "so new sharers hold back" in plain, lines
+        assert "needs gpu+cpu" in stable and "hold back" not in stable, lines
+    finally:
+        for proc in waiters:
+            proc.kill()
+            proc.wait()
+
+
+def test_a_job_leaves_the_queue_once_admitted(gate):
+    gate.background("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sleep", "6")
+    waiter = subprocess.Popen([sys.executable, str(HWGATE), "run", "--needs", "gpu", "--max-wait", "20", "--",
+                               "sleep", "30"], env=gate.environ(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_for_status(gate, "queue: 1 waiting")
+        status = wait_for_status(gate, "\n    sleep 30\n")  # the holder finished and the waiter took the slot
+        assert "queue:" not in status, status
+    finally:
+        waiter.kill()
+        waiter.wait()
 
 
 def test_status_says_so_when_it_cannot_read_the_budget(gate):
@@ -1434,7 +1585,7 @@ def test_status_runs_nothing_external_while_holding_the_admit_lock(monkeypatch, 
     monkeypatch.setattr(module, "sysctl", lambda name: asked.append(lock_is_free(tmp_path / "admit.lock")) or 12)
     holder = hold_lease(torn)
     try:
-        module.cmd_status(None)
+        module.cmd_status(types.SimpleNamespace(full=False))
     finally:
         holder.kill()
         holder.wait()

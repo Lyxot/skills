@@ -115,6 +115,7 @@ import signal
 import statistics
 import struct
 import subprocess
+import shutil
 import sys
 import tempfile
 import threading
@@ -1102,11 +1103,55 @@ def too_hot_to_start(state, cooldown, warm_cooldown, stable):
     return None
 
 
-def acquire(requested, want, held, max_wait, stable, override=None):
+def queue_entry(record):
+    """A locked file under STATE_DIR/queue naming this waiting job, for status; (fd, path).
+
+    Locked by the waiter itself, so it reads as gone the moment the waiter dies, however it dies.
+    """
+    path = os.path.join(STATE_DIR, "queue", "{}-{}.json".format(os.getpid(), os.urandom(4).hex()))
+    # Created already locked: a status reading the queue in between would take an unlocked
+    # file for a dead waiter's and delete it.
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_EXLOCK | os.O_NONBLOCK, 0o644)
+    try:
+        write_text(fd, json.dumps(record))
+    except OSError:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        raise
+    return fd, path
+
+
+def read_queue():
+    """Every live waiter's record, oldest first, dropping the files of waiters that are gone."""
+    waiters = []
+    directory = os.path.join(STATE_DIR, "queue")
+    for name in sorted(os.listdir(directory)) if os.path.isdir(directory) else ():
+        path = os.path.join(directory, name)
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        gone = flock_nb(fd)
+        os.close(fd)
+        if gone:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+            continue
+        try:
+            with open(path) as f:
+                waiters.append(json.load(f))
+        except (OSError, ValueError):
+            pass
+    return sorted(waiters, key=lambda w: w.get("since", 0))
+
+
+def acquire(requested, want, held, max_wait, stable, override=None, queued=None):
     start = time.time()
     delay = 1.0
     last_key, last_logged = None, 0.0
     barriers, handled = {}, set()
+    entry = None
     try:
         while True:
             if override:
@@ -1137,6 +1182,18 @@ def acquire(requested, want, held, max_wait, stable, override=None):
             if key != last_key:
                 log("waiting: " + reason)
                 last_key, last_logged = key, now
+                record = dict(queued or {}, pid=os.getpid(), since=start, reason=reason,
+                              needs=sorted(set(SLOTS) if stable or (state >= FAIR and not override)
+                                           else set(requested)), stable=stable,
+                              override=bool(override),
+                              ahead=bool(barriers))
+                try:
+                    if entry is None:
+                        entry = queue_entry(record)
+                    else:
+                        write_text(entry[0], json.dumps(record))
+                except OSError as e:
+                    log("cannot list this job in the queue ({}); it still waits its turn".format(e))
             elif now - last_logged >= WAIT_REMINDER:
                 log("still waiting after {:.0f}s: {}".format(now - start, reason))
                 last_logged = now
@@ -1148,6 +1205,10 @@ def acquire(requested, want, held, max_wait, stable, override=None):
     finally:
         for fd in barriers.values():
             os.close(fd)
+        if entry is not None:
+            with contextlib.suppress(OSError):
+                os.remove(entry[1])
+            os.close(entry[0])
 
 
 def kill_group(pgid, sig):
@@ -1259,7 +1320,7 @@ def charge_extra(extra, command):
             "child_pid": os.getpid(),
             "pgid": os.getpgrp(),
             "child_start": process_start(os.getpid()),
-            "cmd": " ".join(command)[:500],
+            "cmd": " ".join(command),
             "cwd": os.getcwd(),
             "slots": [],
             "shared": [],
@@ -1306,7 +1367,7 @@ def cmd_run(args):
             " past every heat, battery and queue check".format(
                 override, ", ".join(sorted(set(SLOTS) if args.stable else needs))))
         audit({"event": "override", "pid": os.getpid(), "instruction": override,
-               "cmd": " ".join(command)[:500], "cwd": os.getcwd()})
+               "cmd": " ".join(command), "cwd": os.getcwd()})
     if needs <= held:
         extra = max(0, want - held_cpus)
         env = declared_env(dict(os.environ), args)
@@ -1324,7 +1385,8 @@ def cmd_run(args):
         os.execvpe(command[0], command, env)
     want = max(0, want - held_cpus)
 
-    fds, lease, share, state = acquire(needs, want, held, args.max_wait, args.stable, override)
+    fds, lease, share, state = acquire(needs, want, held, args.max_wait, args.stable, override,
+                                       queued={"cmd": " ".join(command), "cwd": os.getcwd()})
     if fds is None:
         log("gave up after waiting {}s; nothing was started".format(args.max_wait))
         return EXIT_GAVE_UP
@@ -1347,7 +1409,7 @@ def cmd_run(args):
         "child_pid": proc.pid,
         "pgid": proc.pid,
         "child_start": process_start(proc.pid),
-        "cmd": " ".join(command)[:500],
+        "cmd": " ".join(command),
         "cwd": os.getcwd(),
         "slots": sorted(fds),
         "shared": sorted(share),
@@ -1439,20 +1501,85 @@ def cmd_run(args):
     return 128 - rc if rc < 0 else rc
 
 
-def cmd_status(_args):
+def duration(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return "{}s".format(seconds)
+    if seconds < 3600:
+        return "{}m{:02d}s".format(seconds // 60, seconds % 60)
+    return "{}h{:02d}m".format(seconds // 3600, seconds % 3600 // 60)
+
+
+class Painter:
+    """Colour for a terminal that wants it, plain text everywhere else, so agents read the same words."""
+
+    CODES = {"green": "32", "yellow": "33", "red": "31", "bold": "1", "dim": "2"}
+
+    def __init__(self):
+        self.on = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+    def __call__(self, text, style):
+        return "\033[{}m{}\033[0m".format(self.CODES[style], text) if self.on else text
+
+
+def homed(text):
+    home = os.path.expanduser("~")
+    return text.replace(home + "/", "~/") if home != "/" else text
+
+
+def one_line(text, width):
+    text = text.replace("\n", " ↵ ")
+    return text if width is None or len(text) <= width else text[:width - 1] + "…"
+
+
+def shorten_command(command, cwd, width):
+    """The command on one line of `width`, dropping whole trailing words; paths under cwd are relative."""
+    if cwd and cwd != "/":
+        command = command.replace(cwd + "/", "./")
+    command = homed(command).replace("\n", " ↵ ")
+    if width is None or len(command) <= width:
+        return command
+    words, kept = command.split(" "), []
+    for i, word in enumerate(words):
+        tail = " … (+{} words)".format(len(words) - i)
+        if kept and len(" ".join(kept + [word])) + len(tail) > width:
+            return one_line(" ".join(kept), width - len(tail)) + tail
+        kept.append(word)
+    return one_line(command, width)
+
+
+def shorten_path(path, width):
+    """The path within `width`, keeping both ends: where it lives and which directory it is."""
+    path = homed(path)
+    if width is None or len(path) <= width:
+        return path
+    head = width // 2 - 1
+    return path[:head] + "…" + path[-(width - head - 1):]
+
+
+def job_name(job):
+    return "job {}".format(job["child_pid"]) if job.get("child_pid") else job.get("cmd", "a job that has not started yet")
+
+
+def cmd_status(args):
+    paint = Painter()
+    columns = shutil.get_terminal_size((100, 24)).columns if sys.stdout.isatty() else 160
+    width = None if args.full else max(40, columns - 4)
     state, cooldown, warm_cooldown = read_thermal()
-    line = "thermal: {}".format(THERMAL_NAMES.get(state, state))
+    heat = THERMAL_NAMES.get(state, state)
+    line = "thermal: " + paint(heat, "green" if state == NOMINAL else "yellow" if state == FAIR else "red")
     if cooldown > 0 and state < SERIOUS:
         line += " (cooling down, {:.0f}s left)".format(cooldown)
     elif warm_cooldown > 0 and state == NOMINAL:
         line += " (--stable admits in {:.0f}s)".format(warm_cooldown)
     print(line)
     if backup_running():
-        print("time machine: backing up; --stable waits for it to finish")
+        print(paint("time machine: backing up; --stable waits for it to finish", "yellow"))
     reading = battery()
     if reading:
-        hold, _ = battery_hold(reading, record=False)
-        print(hold or "battery: {:.0f}%, {}".format(reading[0], "charging" if reading[1] else "not charging"))
+        hold, refused = battery_hold(reading, record=False)
+        print(paint(hold, "red" if refused else "yellow") if hold else "battery: {:.0f}%, {}".format(
+            reading[0], "charging" if reading[1] else "not charging"))
     ceilings = freq_ceilings()
     if ceilings:
         print("hardware max: " + ", ".join("{} {:.0f} MHz".format(s, ceilings[s]) for s in sorted(ceilings)))
@@ -1464,57 +1591,97 @@ def cmd_status(_args):
         leases = scan_leases() if locked else None
     leases_known = leases is not None
     if not leases_known:
-        print("budget: unknown, another hwgate is holding the admission lock")
+        print(paint("budget: unknown, another hwgate is holding the admission lock", "yellow"))
         leases = []
     else:
         # What declaring jobs hold, not what the machine is using.
-        print("budget: {}/{} cores declared".format(
-            sum(lease["cpus"] for lease in leases), cpu_budget()))
-    for slot in SLOTS:
-        waiting = barrier_holder(slot)
-        waiting = "\n    {} is waiting for the whole slot, so new jobs hold back".format(
-            waiting) if waiting else ""
-        fd = try_lock(slot)
-        if fd is not None:
-            os.close(fd)
-            print("{}: free{}".format(slot, waiting))
-            continue
-        shared_fd = try_lock(slot, shared=True)
-        if shared_fd is not None:
-            os.close(shared_fd)
-            # Listed on the same field the count uses, so every job counted is named;
-            # reading "shared" instead leaves out a lease that predates that field.
-            sharers = [lease for lease in leases if slot in lease["slots"]]
-            print("{}: {} of {} jobs{}".format(
-                slot, slot_occupants(slot, leases), SLOT_PARALLEL, waiting))
-            for lease in sharers:
-                print("    {} cores, {}".format(lease["cpus"], describe_holder(lease)))
-            continue
-        info = read_info(slot)
-        if not info:
-            print("{}: busy (holder unknown){}".format(slot, waiting))
-            continue
-        left = ""
-        if info.get("deadline"):
-            left = ", {:.0f}s to deadline".format(info["deadline"] - time.time())
-        wrapper = "" if pid_alive(info["wrapper_pid"]) else ", wrapper gone"
-        stable = ", --stable" if info.get("stable") else ""
-        print("{}: busy, pid {} for {:.0f}s{}{}{}{}\n    {}\n    in {}".format(
-            slot, info["child_pid"], time.time() - info["started"], left, wrapper, stable, waiting,
-            info["cmd"], info["cwd"]
-        ))
+        print("budget: {}/{} cores declared".format(sum(lease["cpus"] for lease in leases), cpu_budget()))
     if fan_helper_installed():
         try:
             pinned = re.search(r"^fan \d+: .*, manual$", run_fans("status"), re.M) is not None
         except OSError as e:
-            print("fans: unknown ({})".format(e))
+            print(paint("fans: unknown ({})".format(e), "yellow"))
         else:
             if pinned and (not leases_known or any(lease.get("stable") for lease in leases)):
                 print("fans: pinned at maximum")
             elif pinned:
                 # Only a wrapper killed outright skips handing them back.
-                print("fans: pinned at maximum with no --stable run; restore with: {} auto".format(
-                    " ".join(FAN_CMD)))
+                print(paint("fans: pinned at maximum with no --stable run; restore with: {} auto".format(
+                    " ".join(FAN_CMD)), "red"))
+
+    print()
+    # Each job once, however many slots it holds; keyed by pid, so a holder known only from an
+    # info file left by a version without leases is not listed twice either.
+    jobs = {}
+    for slot in SLOTS:
+        holders = [lease for lease in leases if slot in lease["slots"]]
+        fd = try_lock(slot)
+        shared_fd = None if fd is not None else try_lock(slot, shared=True)
+        if fd is not None:
+            os.close(fd)
+            line = "{}: {}".format(slot, paint("free", "green"))
+        elif shared_fd is not None:
+            os.close(shared_fd)
+            line = "{}: {}".format(slot, paint("{} of {} jobs".format(slot_occupants(slot, leases), SLOT_PARALLEL), "yellow"))
+        else:
+            info = None if holders else read_info(slot)
+            if info:
+                holders = [dict(info, path="info:" + slot, slots=info.get("slots") or [slot], shared=[])]
+            line = "{}: {}".format(slot, paint("busy", "red")) + ("" if holders else " (holder unknown)")
+        for holder in holders:
+            jobs.setdefault(holder.get("child_pid") or holder["path"], holder)
+        if holders:
+            line += " ({})".format(", ".join(job_name(holder) for holder in holders))
+        print(line)
+        waiting = barrier_holder(slot)
+        if waiting:
+            print("    {} is waiting for the whole slot, so new jobs hold back".format(waiting))
+    for lease in leases:
+        if not lease["slots"] and lease["cpus"]:
+            jobs.setdefault(lease.get("child_pid") or lease["path"], lease)
+
+    now = time.time()
+    waiters = read_queue()
+    if waiters:
+        print()
+        # Waiters retry every second or two and whichever asks first once a slot frees gets it,
+        # so arrival is all that can be shown; only a barrier changes who goes first.
+        print("queue: {} waiting{}".format(len(waiters), ", by arrival; there is no fixed order: whoever asks first"
+                                           " once a slot frees gets it, except that new sharers hold back for a job"
+                                           " waiting for a whole slot" if len(waiters) > 1 else ""))
+        for waiter in waiters:
+            bits = [paint("--user-override", "red")] if waiter.get("override") else []
+            bits += [paint("--stable", "bold")] if waiter.get("stable") else []
+            bits.append("needs " + "+".join(s for s in SLOTS if s in waiter.get("needs", ())))
+            bits.append("waiting " + duration(now - waiter.get("since", now)))
+            if waiter.get("ahead"):
+                bits.append(paint("waiting for a whole slot, so new sharers hold back", "yellow"))
+            print("  {}: {}".format(paint("pid {}".format(waiter.get("pid")), "bold"), ", ".join(bits)))
+            print("      " + one_line(waiter.get("reason", ""), None if width is None else width - 2))
+            if waiter.get("cmd"):
+                print("      " + shorten_command(waiter["cmd"], waiter.get("cwd"), None if width is None else width - 2))
+    for job in jobs.values():
+        print()
+        bits = [paint("--stable", "bold")] if job.get("stable") else []
+        if job["slots"]:
+            verb = "shares" if set(job["slots"]) <= set(job.get("shared", ())) else "holds"
+            bits.append("{} {}".format(verb, "+".join(s for s in SLOTS if s in job["slots"])))
+        else:
+            bits.append("cores for a nested job")
+        if job.get("cpus"):
+            bits.append("{} cores".format(job["cpus"]))
+        if job.get("started") and job.get("child_pid"):
+            bits.append(duration(now - job["started"]) + " running")
+        if job.get("deadline"):
+            left = job["deadline"] - now
+            bits.append(duration(left) + " to deadline" if left > 0 else paint("past its deadline", "red"))
+        if isinstance(job.get("wrapper_pid"), int) and not pid_alive(job["wrapper_pid"]):
+            bits.append(paint("wrapper gone", "red"))
+        print("{}: {}".format(paint(job_name(job), "bold"), ", ".join(bits)))
+        if job.get("child_pid") and job.get("cmd"):
+            print("    " + shorten_command(job["cmd"], job.get("cwd"), width))
+        if job.get("cwd"):
+            print("    " + paint("in " + shorten_path(job["cwd"], None if width is None else width - 3), "dim"))
     return 0
 
 
@@ -1531,9 +1698,11 @@ def main():
     run.add_argument("--min-freq-ratio", type=float, help="--stable: also abort with 76 once a busy unit stays below this fraction of its hardware maximum frequency for longer than --throttle-budget, whatever the heat (e.g. 0.85)")
     run.add_argument("--user-override", metavar="INSTRUCTION", help="ONLY when the user explicitly told you to take the machine for this job, never on your own judgement or a standing permission: their instruction, quoted verbatim. Kills every job holding the slots this job needs (--cpus counts as needing the cpu slot; killed jobs exit 78) and starts it at once with those slots to itself, past every heat, battery and queue check (a --stable one can still exit 76 once running). Logged to overrides.log")
     run.add_argument("command", nargs=argparse.REMAINDER)
-    sub.add_parser("status", help="show thermal state and who holds each slot")
+    status = sub.add_parser("status", help="show thermal state and who holds each slot")
+    status.add_argument("--full", action="store_true", help="print each job's whole command instead of one line of it")
     args = parser.parse_args()
-    os.makedirs(os.path.join(STATE_DIR, "leases"), exist_ok=True)
+    for directory in ("leases", "queue"):
+        os.makedirs(os.path.join(STATE_DIR, directory), exist_ok=True)
     return cmd_run(args) if args.action == "run" else cmd_status(args)
 
 
