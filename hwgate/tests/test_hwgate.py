@@ -1111,6 +1111,123 @@ def test_min_freq_ratio_aborts_a_run_that_stays_below_it(gate, tmp_path, share, 
     assert ("below 85% of its" in result.stderr) is (code == 76)
 
 
+# Forced counters cover 0.5s of OFF time, about as long as a run of a short job takes, since
+# counters that do not cover the run leave it unqualified.
+PAD = 12_000_000
+
+
+def residency_run(gate, tmp_path, delta, threshold="0.999", table=(500, 1000), exit_code=0, cltm=None, **extra):
+    """A --stable run whose job moves the forced GPU state counters (and CLTM's) by these deltas from a nonzero start."""
+    def endpoints(delta, pad):
+        before = [[name, 7_000_000 + i] for i, (name, _) in enumerate(delta)]
+        return before, [[name, ticks + by + (PAD if name == pad else 0)] for (name, ticks), (_, by) in zip(before, delta)]
+
+    path = tmp_path / "states.json"
+    before, after = endpoints(delta, "OFF")
+    first, last = {"table": list(table), "states": before}, {"table": list(table), "states": after}
+    if cltm is not None:
+        first["cltm"], last["cltm"] = endpoints(cltm, None)
+    path.write_text(json.dumps(first))
+    write = "import sys; open(sys.argv[1], 'w').write(sys.argv[2]); sys.exit(int(sys.argv[3]))"
+    extra.setdefault("HWGATE_TOP_CLOCK_MIN_ACTIVE", "0")
+    return gate("run", "--needs", "gpu", "--stable", "--min-top-clock-residency", threshold, "--max-wait", "3",
+                "--", sys.executable, "-c", write, str(path), json.dumps(last), str(exit_code),
+                HWGATE_FORCE_GPU_STATES=path, **extra)
+
+
+@pytest.mark.parametrize("below, threshold, code", [(1, "0.999", 0), (2, "0.999", 79),
+                                                    (1, "0.99900000000000000001", 79)])
+def test_top_clock_residency_compares_exactly_at_the_threshold(gate, tmp_path, below, threshold, code):
+    result = residency_run(gate, tmp_path, [("OFF", 500), ("P1", below), ("P2", 1000 - below)], threshold)
+    assert result.returncode == code, result.stderr
+    assert ("CLOCK_RESIDENCY_BELOW_THRESHOLD" in result.stderr) is (code == 79), result.stderr
+    # Deltas from a nonzero start, not the counters' totals.
+    assert "{:.2%} of".format((1000 - below) / 1000) in result.stderr, result.stderr
+    assert "OFF={} P1={}".format(500 + PAD, below) in result.stderr, result.stderr
+
+
+def test_top_clock_is_the_tables_maximum_wherever_it_sits(gate, tmp_path):
+    result = residency_run(gate, tmp_path, [("OFF", 0), ("P1", 0), ("P2", 10), ("P3", 0)], table=(500, 1000, 900))
+    assert result.returncode == 0 and "at its 1000 MHz max for 100.00%" in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("past, code", [(0, 0), (1, 79)], ids=["idle", "busy"])
+def test_time_in_a_state_past_the_table_leaves_the_run_unqualified(gate, tmp_path, past, code):
+    result = residency_run(gate, tmp_path, [("OFF", 0), ("P1", 0), ("P2", 1000), ("P3", past)])
+    assert result.returncode == code, result.stderr
+    assert ("CLOCK_TELEMETRY_UNAVAILABLE: time in GPU states with no known frequency (P3)" in result.stderr) is bool(past)
+
+
+# The minimum is 0.01s; the run itself lasts longer, so only active ticks can decide.
+@pytest.mark.parametrize("active, code", [(24_000, 79), (480_000, 0)], ids=["1ms", "20ms"])
+def test_only_active_gpu_time_counts_toward_the_minimum(gate, tmp_path, active, code):
+    result = residency_run(gate, tmp_path, [("OFF", 0), ("P1", 0), ("P2", active)], HWGATE_TOP_CLOCK_MIN_ACTIVE="0.01")
+    assert result.returncode == code, result.stderr
+    assert ("INSUFFICIENT_ACTIVE_TIME" in result.stderr) is (code == 79), result.stderr
+
+
+def test_counters_that_do_not_cover_the_run_never_pass(gate, tmp_path):
+    """A job of 3s whose counters moved by 0.1s, all at the top clock."""
+    path = tmp_path / "states.json"
+    path.write_text(json.dumps({"table": [500, 1000], "states": [["OFF", 0], ["P1", 0], ["P2", 0]]}))
+    after = json.dumps({"table": [500, 1000], "states": [["OFF", 0], ["P1", 0], ["P2", 2_400_000]]})
+    job = "import sys, time; time.sleep(3); open(sys.argv[1], 'w').write(sys.argv[2])"
+    result = gate("run", "--needs", "gpu", "--stable", "--min-top-clock-residency", "0.99", "--max-wait", "3",
+                  "--", sys.executable, "-c", job, str(path), after,
+                  HWGATE_FORCE_GPU_STATES=path, HWGATE_TOP_CLOCK_MIN_ACTIVE="0")
+    assert result.returncode == 79 and "counters cover 0.1s of a 3." in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("cltm, shown", [
+    ([("OFF", 0), ("P7", 250), ("NO_CLTM", 750)], "GPU_CLTM outside NO_CLTM for 25.00% of the run: P7=250 NO_CLTM=750"),
+    ([("OFF", 0), ("P7", 250)], "CLTM unavailable"),
+    (None, "CLTM unavailable (no GPU_CLTM channel)"),
+], ids=["reported", "no-NO_CLTM", "no-channel"])
+def test_cltm_is_reported_beside_the_verdict_and_never_decides_it(gate, tmp_path, cltm, shown):
+    result = residency_run(gate, tmp_path, [("OFF", 0), ("P1", 0), ("P2", 1000)], cltm=cltm)
+    assert result.returncode == 0 and shown in result.stderr, result.stderr
+
+
+def test_cltm_counters_that_do_not_cover_the_run_are_unavailable_not_zero(gate, tmp_path):
+    """A 3s job whose GPU counters cover it while CLTM's moved by one tick."""
+    path = tmp_path / "states.json"
+    states = lambda gpu, no_cltm: {"table": [500, 1000], "states": [["OFF", 0], ["P1", 0], ["P2", gpu]],
+                                   "cltm": [["OFF", 0], ["NO_CLTM", no_cltm]]}
+    path.write_text(json.dumps(states(0, 0)))
+    job = "import sys, time; time.sleep(3); open(sys.argv[1], 'w').write(sys.argv[2])"
+    result = gate("run", "--needs", "gpu", "--stable", "--min-top-clock-residency", "0.99", "--max-wait", "3",
+                  "--", sys.executable, "-c", job, str(path), json.dumps(states(72_000_000, 1)),
+                  HWGATE_FORCE_GPU_STATES=path, HWGATE_TOP_CLOCK_MIN_ACTIVE="0")
+    assert result.returncode == 0, result.stderr
+    assert "CLTM unavailable (its counters cover 0.0s of a 3." in result.stderr, result.stderr
+
+
+def test_unreadable_residency_never_passes(gate, tmp_path):
+    result = gate("run", "--needs", "gpu", "--stable", "--min-top-clock-residency", "0.5", "--max-wait", "3",
+                  "--", "true", HWGATE_FORCE_GPU_STATES=tmp_path / "missing.json")
+    assert result.returncode == 79 and "CLOCK_TELEMETRY_UNAVAILABLE" in result.stderr, result.stderr
+
+
+def test_a_failed_job_keeps_its_exit_status_under_the_residency_check(gate, tmp_path):
+    result = residency_run(gate, tmp_path, [("OFF", 0), ("P1", 1000), ("P2", 0)], exit_code=3)
+    assert result.returncode == 3 and "UNQUALIFIED" in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("args", [["--min-top-clock-residency", "0.99"],
+                                  ["--stable", "--min-top-clock-residency", "1.5"],
+                                  ["--stable", "--min-top-clock-residency", "0"]],
+                         ids=["without-stable", "over-one", "zero"])
+def test_min_top_clock_residency_needs_stable_and_a_fraction(gate, args):
+    result = gate("run", "--needs", "gpu", *args, "--max-wait", "2", "--", "echo", "ran")
+    assert result.returncode == 2 and "ran" not in result.stdout
+
+
+def test_min_top_clock_residency_needs_the_gpu(gate):
+    result = gate("run", "--needs", "cpu", "--stable", "--min-top-clock-residency", "0.99", "--max-wait", "2",
+                  "--", "echo", "ran")
+    assert result.returncode == 2 and "needs --stable and --needs gpu" in result.stderr
+
+
 def scripted_watch(monkeypatch, slots, min_ratio=None):
     """A ThrottleWatch on a fake clock against 1000 MHz ceilings, fed samples by the caller."""
     module = load_hwgate()

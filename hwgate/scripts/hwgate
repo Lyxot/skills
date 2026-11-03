@@ -58,6 +58,14 @@ Stable-performance jobs (--stable: benchmarks, timing or throughput runs):
   - with --min-freq-ratio R, are also killed with 76 once a busy watched unit
     stays below R of its hardware maximum for longer than --throttle-budget,
     whatever the heat;
+  - with --min-top-clock-residency R and --needs gpu, exit 79 when the GPU
+    spent less than R of the job's active time at its hardware-maximum clock,
+    counted from IOReport state residency read just before the job starts and
+    just after it exits. Time in a state with no known frequency, or under
+    TOP_CLOCK_MIN_ACTIVE seconds of activity, leaves the run unqualified (79)
+    rather than passed. The counters are machine-wide, and the window includes
+    loading and warmup. A job that fails keeps its own exit status. The
+    report adds GPU_CLTM residency (the thermal manager) as evidence only;
   - wait to start while a Time Machine backup runs, and are killed with 76
     once one starts (checked every BACKUP_POLL seconds);
   - run with every fan pinned at its maximum, handed back to macOS when the
@@ -96,7 +104,9 @@ Usage:
 Exit codes: the job's own code; 124 on timeout; 75 when --max-wait ran out
 before the job could start; 76 when a --stable job was aborted for
 throttling or a Time Machine backup; 77 when a low battery that is not
-charging refused the job; 78 when a --user-override killed the job; 2 on bad usage or a request larger than the machine's budget.
+charging refused the job; 78 when a --user-override killed the job; 79 when
+a --min-top-clock-residency run was not certified at the GPU's top clock; 2 on
+bad usage or a request larger than the machine's budget.
 """
 
 import argparse
@@ -106,6 +116,7 @@ import ctypes
 import ctypes.util
 import errno
 import fcntl
+import fractions
 import json
 import os
 import plistlib
@@ -129,6 +140,7 @@ EXIT_GAVE_UP = 75
 EXIT_UNSTABLE = 76
 EXIT_LOW_BATTERY = 77
 EXIT_PREEMPTED = 78
+EXIT_UNQUALIFIED = 79
 # Next to a lease: the instruction of the --user-override that killed its job.
 PREEMPTED = ".preempted"
 EXIT_USAGE = 2
@@ -169,12 +181,17 @@ BUSY = 0.5
 FREQ_DROP = 0.10
 # A --stable run whose median sits below this share of the hardware maximum gets a rerun hint.
 FREQ_ADVICE = 0.85
+# Below this much active GPU time, sampling at the run's two ends dominates the residency share.
+TOP_CLOCK_MIN_ACTIVE = float(os.environ.get("HWGATE_TOP_CLOCK_MIN_ACTIVE", "5"))
+GPU_TICKS_PER_S = 24e6  # IOReport GPUPH residency unit
 # Per slot: IOReport group, subgroup, channel-name prefix, pmgr DVFS table key.
 FREQ_SOURCES = {
     "gpu": ("GPU Stats", "GPU Performance States", "GPUPH", "voltage-states9"),
     "cpu": ("CPU Stats", "CPU Core Performance States", "PCPU", "voltage-states5-sram"),
 }
 IDLE_STATES = {"IDLE", "DOWN", "OFF"}
+# GPU residency under the closed-loop thermal manager (CLTM); NO_CLTM is time without its limit. Diagnostic only.
+GPU_CLTM = ("GPU Stats", "CLTM-induced GPU Performance States", "GPU_CLTM")
 
 _objc = None
 _BUDGETS = {}
@@ -415,7 +432,7 @@ class FreqSampler:
 
     UTF8 = 0x08000100
 
-    def __init__(self, slots):
+    def __init__(self, slots, extra=()):
         self.forced = os.environ.get("HWGATE_FORCE_FREQ")
         if self.forced:
             return
@@ -445,8 +462,7 @@ class FreqSampler:
         self.cf, self.ior = cf, ior
         self.prefixes = {FREQ_SOURCES[s][2]: s for s in slots}
         channels = None
-        for slot in slots:
-            group, subgroup = FREQ_SOURCES[slot][:2]
+        for group, subgroup in [FREQ_SOURCES[slot][:2] for slot in slots] + [e[:2] for e in extra]:
             found = ior.IOReportCopyChannelsInGroup(self._cfstr(group), self._cfstr(subgroup), 0, 0, 0)
             if channels is None:
                 channels = found
@@ -467,6 +483,24 @@ class FreqSampler:
     def _pystr(self, ref):
         buf = ctypes.create_string_buffer(128)
         return buf.value.decode() if ref and self.cf.CFStringGetCString(ref, buf, 128, self.UTF8) else ""
+
+    def channel_states(self, names):
+        """{channel: [(state, cumulative residency)...]} from one sample, for each named channel present once."""
+        cf, ior = self.cf, self.ior
+        current = ior.IOReportCreateSamples(self.sub, self.subscribed, None)
+        try:
+            items = cf.CFDictionaryGetValue(current, self.key)
+            found = {}
+            for i in range(cf.CFArrayGetCount(items) if items else 0):
+                item = cf.CFArrayGetValueAtIndex(items, i)
+                name = self._pystr(ior.IOReportChannelGetChannelName(item))
+                if name in names:
+                    found.setdefault(name, []).append([(self._pystr(ior.IOReportStateGetNameForIndex(item, k)),
+                                                        ior.IOReportStateGetResidency(item, k))
+                                                       for k in range(ior.IOReportStateGetCount(item))])
+        finally:
+            cf.CFRelease(current)
+        return {name: states[0] for name, states in found.items() if len(states) == 1}
 
     def sample(self):
         """Return {slot: (MHz while busy, busy fraction)}."""
@@ -608,6 +642,110 @@ class ThrottleWatch:
                 " unlikely to help.".format(
                     slot, median, median / ceiling, ceiling, statistics.mean(self.nominal_busy[slot])))
         return lines
+
+
+class TopClockResidency:
+    """Share of a whole job's active GPU time spent at the hardware-maximum clock.
+
+    The nth non-idle IOReport state is the nth nonzero pmgr frequency, with no clamp:
+    a state past the table, or a P-state name that is not P<n>, is unknown, and any
+    time in one leaves the run unqualified rather than counted as top or not.
+    """
+
+    def __init__(self):
+        self.error = self.start = None
+        forced = os.environ.get("HWGATE_FORCE_GPU_STATES")
+        try:
+            if forced:
+                # Tests: {"table": [MHz...], "states": [[name, ticks]...], "cltm": [...]}, rewritten by the job.
+                def read_forced():
+                    with open(forced) as f:
+                        return json.load(f)
+                self.read = lambda: {name: [tuple(s) for s in states] for name, states in
+                                     (("GPUPH", read_forced().get("states")), ("GPU_CLTM", read_forced().get("cltm")))
+                                     if states is not None}
+                self.table = read_forced()["table"]
+            else:
+                sampler = FreqSampler(["gpu"], extra=[GPU_CLTM])
+                if sampler.forced:
+                    raise OSError("frequency readings are forced")
+                self.read = lambda: sampler.channel_states({FREQ_SOURCES["gpu"][2], GPU_CLTM[2]})
+                self.table = sampler.tables["gpu"]
+            if not self.table:
+                raise OSError("no GPU DVFS table")
+            self.start = (time.monotonic(), self.read())
+        except Exception as e:
+            self.error = "cannot read GPU state residency ({})".format(e)
+
+    def verdict(self, threshold):
+        """(True, False or None for unqualified, one-line report)."""
+        if self.error:
+            return None, "CLOCK_TELEMETRY_UNAVAILABLE: " + self.error
+        began, first_read = self.start
+        try:
+            last_read = self.read()
+        except Exception as e:
+            return None, "CLOCK_TELEMETRY_UNAVAILABLE: lost GPU state residency ({})".format(e)
+        elapsed = time.monotonic() - began
+        channel = FREQ_SOURCES["gpu"][2]
+        if channel not in first_read or channel not in last_read:
+            return None, "CLOCK_TELEMETRY_UNAVAILABLE: no single {} channel".format(channel)
+        first, last = first_read[channel], last_read[channel]
+        if [n for n, _ in first] != [n for n, _ in last]:
+            return None, "CLOCK_TELEMETRY_UNAVAILABLE: the GPU's state list changed during the run"
+        deltas = [(n, b - a) for (n, a), (_, b) in zip(first, last)]
+        if any(d < 0 for _, d in deltas):
+            return None, "CLOCK_TELEMETRY_UNAVAILABLE: a GPU residency counter went backwards"
+        top_mhz, active, top, weighted, unknown, ordinal = max(self.table), 0, 0, 0.0, [], 0
+        for name, ticks in deltas:
+            if name in IDLE_STATES:
+                continue
+            mhz = self.table[ordinal] if ordinal < len(self.table) and re.fullmatch(r"P\d+", name) else None
+            ordinal += 1
+            active += ticks
+            if mhz is None:
+                if ticks:
+                    unknown.append(name)
+                continue
+            weighted += ticks * mhz
+            top += ticks if mhz == top_mhz else 0
+        covered, active_s = sum(d for _, d in deltas) / GPU_TICKS_PER_S, active / GPU_TICKS_PER_S
+        detail = "whole job, {} excluded as idle; states {}; {}".format(
+            "/".join(sorted(IDLE_STATES)), " ".join("{}={}".format(n, d) for n, d in deltas),
+            cltm_report(first_read.get(GPU_CLTM[2]), last_read.get(GPU_CLTM[2]), elapsed))
+        if not covers(covered, elapsed):
+            return None, "CLOCK_TELEMETRY_UNAVAILABLE: the GPU counters cover {:.1f}s of a {:.1f}s run; {}".format(
+                covered, elapsed, detail)
+        if unknown:
+            return None, "CLOCK_TELEMETRY_UNAVAILABLE: time in GPU states with no known frequency ({}); {}".format(
+                ", ".join(unknown), detail)
+        if not active or active_s < TOP_CLOCK_MIN_ACTIVE:
+            return None, "INSUFFICIENT_ACTIVE_TIME: GPU active {:.1f}s, under the {:.0f}s needed; {}".format(
+                active_s, TOP_CLOCK_MIN_ACTIVE, detail)
+        passed = top * threshold.denominator >= active * threshold.numerator
+        return passed, "gpu at its {:.0f} MHz max for {:.2%} of {:.1f}s active (needs {}), average {:.0f} MHz;" \
+            " {}".format(top_mhz, top / active, active_s, float(threshold), weighted / active, detail)
+
+
+def covers(seconds, elapsed):
+    """Whether counters that moved by `seconds` account for the run; the two reads are not atomic."""
+    return abs(seconds - elapsed) <= 1.0 + 0.05 * elapsed
+
+
+def cltm_report(first, last, elapsed):
+    """The share of the run outside NO_CLTM, as evidence beside the verdict, never part of it."""
+    if first is None or last is None:
+        return "CLTM unavailable (no GPU_CLTM channel)"
+    if [n for n, _ in first] != [n for n, _ in last]:
+        return "CLTM unavailable (its state list changed)"
+    deltas = [(n, b - a) for (n, a), (_, b) in zip(first, last)]
+    total = sum(d for _, d in deltas)
+    if any(d < 0 for _, d in deltas) or not total or "NO_CLTM" not in dict(deltas):
+        return "CLTM unavailable (counters went backwards, did not move, or lack NO_CLTM)"
+    if not covers(total / GPU_TICKS_PER_S, elapsed):
+        return "CLTM unavailable (its counters cover {:.1f}s of a {:.1f}s run)".format(total / GPU_TICKS_PER_S, elapsed)
+    return "GPU_CLTM outside NO_CLTM for {:.2%} of the run: {}".format(
+        1 - dict(deltas)["NO_CLTM"] / total, " ".join("{}={}".format(n, d) for n, d in deltas if d))
 
 
 def fan_helper_installed():
@@ -1263,6 +1401,16 @@ def positive_int(text):
     return int(text)
 
 
+def residency_threshold(text):
+    try:
+        value = fractions.Fraction(text)
+    except (ValueError, ZeroDivisionError):
+        value = None
+    if value is None or not 0 < value <= 1:
+        raise argparse.ArgumentTypeError("--min-top-clock-residency takes a fraction in (0, 1], such as 0.99")
+    return value
+
+
 def parse_slots(text):
     slots = {s.strip() for s in text.split(",") if s.strip()}
     unknown = slots - set(SLOTS)
@@ -1350,6 +1498,9 @@ def cmd_run(args):
     if args.min_freq_ratio is not None and not (args.stable and 0 < args.min_freq_ratio <= 1):
         log("--min-freq-ratio needs --stable and a fraction in (0, 1], such as 0.85")
         return EXIT_USAGE
+    if args.min_top_clock_residency is not None and not (args.stable and "gpu" in needs):
+        log("--min-top-clock-residency needs --stable and --needs gpu")
+        return EXIT_USAGE
     if args.stable and inside_another_job(held):
         log("--stable cannot run inside another gated job: it cannot take the slots that job already"
             " holds, hold out for nominal heat, or watch for throttling, so its numbers would be"
@@ -1398,6 +1549,8 @@ def cmd_run(args):
     deadline = time.time() + args.timeout if args.timeout > 0 else None
     if args.stable:
         pin_fans()
+    # Read before the job starts, so its first instant is in the count.
+    residency = TopClockResidency() if args.min_top_clock_residency is not None else None
     # The job inherits the slot locks, so a slot stays taken while the job
     # really runs, even if this wrapper is killed.
     proc = subprocess.Popen(
@@ -1475,6 +1628,16 @@ def cmd_run(args):
             log("KILLED by a --user-override: the user asked for this machine ({!r}). Treat partial results as"
                 " invalid; a rerun waits behind that job.".format(said))
             rc = EXIT_PREEMPTED
+        if residency and rc not in (EXIT_UNSTABLE, EXIT_PREEMPTED, EXIT_TIMEOUT):
+            passed, report = residency.verdict(args.min_top_clock_residency)
+            if passed:
+                log("--stable: " + report)
+            else:
+                log("UNQUALIFIED --stable run: {}{}. Its timings are not certified at the GPU's top clock{}.".format(
+                    "" if passed is None else "CLOCK_RESIDENCY_BELOW_THRESHOLD: ", report,
+                    "" if rc == 0 else "; the job's own exit status is kept"))
+                # The job's own failure says more than the qualification does.
+                rc = EXIT_UNQUALIFIED if rc == 0 else rc
         if watch and rc not in (EXIT_UNSTABLE, EXIT_PREEMPTED):
             log("--stable run: " + watch.summary())
             for line in watch.advice():
@@ -1695,6 +1858,7 @@ def main():
     run.add_argument("--max-wait", type=float, default=0, help="seconds to wait for admission before exiting 75; 0 waits forever")
     run.add_argument("--stable", action="store_true", help="needs stable performance: start alone at nominal after a cooldown and with no Time Machine backup running, abort with 76 once throttled or a backup starts")
     run.add_argument("--throttle-budget", type=float, default=DEFAULT_THROTTLE_BUDGET, help="--stable: seconds of continuous throttling (heat plus a frequency drop) tolerated before aborting (default %(default)s)")
+    run.add_argument("--min-top-clock-residency", type=residency_threshold, help="--stable --needs gpu: exit 79 unless the GPU spent at least this fraction of the job's active time at its hardware-maximum clock, counted over the whole job (e.g. 0.99); off by default")
     run.add_argument("--min-freq-ratio", type=float, help="--stable: also abort with 76 once a busy unit stays below this fraction of its hardware maximum frequency for longer than --throttle-budget, whatever the heat (e.g. 0.85)")
     run.add_argument("--user-override", metavar="INSTRUCTION", help="ONLY when the user explicitly told you to take the machine for this job, never on your own judgement or a standing permission: their instruction, quoted verbatim. Kills every job holding the slots this job needs (--cpus counts as needing the cpu slot; killed jobs exit 78) and starts it at once with those slots to itself, past every heat, battery and queue check (a --stable one can still exit 76 once running). Logged to overrides.log")
     run.add_argument("command", nargs=argparse.REMAINDER)
