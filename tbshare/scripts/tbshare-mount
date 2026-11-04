@@ -1,0 +1,169 @@
+#!/usr/bin/python3 -I
+"""Root helper: mount the configured SMB share over the configured link, as the user who ran sudo.
+
+It takes no arguments, so a NOPASSWD rule for it lets agents mount exactly one share at
+exactly one place and nothing else. The share, account, link and mount point come from CONF
+(root-owned); the password from SECRET (root-only), typed into mount_smbfs's prompt on a
+root-only pty so it never appears in a process listing and no other process can read it.
+The server is the one other host answering on the link, mounted at its IPv6 link-local
+address scoped to the link, so no route or name lookup can send it over another one.
+"""
+import configparser
+import fcntl
+import os
+import re
+import select
+import subprocess
+import sys
+import termios
+import time
+import urllib.parse
+
+CONF = "/usr/local/etc/tbshare/config"
+SECRET = "/usr/local/etc/tbshare/secret"
+MOUNT_SMBFS = "/sbin/mount_smbfs"
+MOUNT_DEADLINE = 60.0
+
+
+def fail(message):
+    print("tbshare-mount: " + message, file=sys.stderr)
+    sys.exit(1)
+
+
+def root_owned(path, private=False):
+    st = os.lstat(path)
+    mask = 0o077 if private else 0o022
+    if st.st_uid != 0 or st.st_mode & mask or not os.path.isfile(path) or os.path.islink(path):
+        fail("{} must be a regular file owned by root{}".format(path, ", readable only by root" if private else ""))
+
+
+def load():
+    root_owned(CONF)
+    root_owned(SECRET, private=True)
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read(CONF)
+    conf = dict(parser["tbshare"])
+    for key in ("share", "user", "interface", "mountpoint"):
+        if not conf.get(key):
+            fail("{} has no {}".format(CONF, key))
+    with open(SECRET) as f:
+        password = f.read().rstrip("\n")
+    return conf, password
+
+
+def peers(interface):
+    """IPv6 link-local addresses of the other hosts answering an all-nodes ping on `interface`."""
+    # This Mac answers each probe at once, so ping6 ends right after the last one; three probes
+    # half a second apart give the server a second to answer.
+    out = subprocess.run(["/sbin/ping6", "-c", "3", "-i", "0.5", "-I", interface, "ff02::1"],
+                         capture_output=True, text=True, timeout=10).stdout
+    mine = subprocess.run(["/sbin/ifconfig", interface], capture_output=True, text=True, timeout=5).stdout
+    own = set(re.findall(r"inet6 (fe80::[0-9a-f:]+)%", mine))
+    found = re.findall(r"bytes from (fe80::[0-9a-f:]+)%{},".format(re.escape(interface)), out)
+    return sorted(set(found) - own)
+
+
+def link_address(interface):
+    """The one other host on the link, or None; more than one is refused rather than guessed."""
+    found = peers(interface)
+    if len(found) > 1:
+        fail("{} hosts answer on {} ({}); tbshare expects one".format(len(found), interface, ", ".join(found)))
+    return found[0] if found else None
+
+
+def prepare_mountpoint(path, uid, gid):
+    """Returns whether it created the directory."""
+    if not re.fullmatch(r"/Volumes/[^/]+", path) or path.endswith("/.."):
+        fail("mountpoint must be a directory directly under /Volumes, not {}".format(path))
+    if os.path.ismount(path):
+        fail("{} is already mounted; unmount it first".format(path))
+    created = False
+    if os.path.lexists(path):
+        if os.path.islink(path) or not os.path.isdir(path) or os.listdir(path):
+            fail("{} exists and is not an empty directory".format(path))
+    else:
+        os.mkdir(path, 0o755)
+        created = True
+    os.chown(path, uid, gid)
+    return created
+
+
+def mount_as(uid, gid, url, mountpoint, password):
+    """Run mount_smbfs as uid on a pty and type the password at its prompt; (exit code, output)."""
+    master, slave = os.openpty()
+    # Root-only, so no other process can open the slave and read the password from it;
+    # the child keeps it as its controlling terminal and standard streams.
+    os.fchown(slave, 0, 0)
+    os.fchmod(slave, 0o600)
+    # Echo off before the child runs, so the password never comes back however the child prompts.
+    attrs = termios.tcgetattr(slave)
+    attrs[3] &= ~termios.ECHO
+    termios.tcsetattr(slave, termios.TCSANOW, attrs)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(master)
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            for fd in (0, 1, 2):
+                os.dup2(slave, fd)
+            os.setgroups([gid])
+            os.setgid(gid)
+            os.setuid(uid)
+            os.execv(MOUNT_SMBFS, [MOUNT_SMBFS, url, mountpoint])
+        finally:
+            os._exit(127)
+    os.close(slave)
+    output, sent, deadline = b"", False, time.time() + MOUNT_DEADLINE
+    while time.time() < deadline:
+        ready, _, _ = select.select([master], [], [], 0.5)
+        if not ready:
+            continue
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        output += chunk
+        if not sent and b"assword" in output:
+            os.write(master, password.encode() + b"\n")
+            sent = True
+    else:
+        os.kill(pid, 9)
+    os.close(master)
+    _, status = os.waitpid(pid, 0)
+    code = os.waitstatus_to_exitcode(status)
+    return code, output.decode(errors="replace").replace(password, "<password>").strip()
+
+
+def main():
+    if len(sys.argv) > 1:
+        fail("takes no arguments")
+    if os.geteuid() != 0:
+        fail("run it with sudo")
+    try:
+        uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+    except (KeyError, ValueError):
+        fail("run it through sudo from your own account")
+    if uid == 0:
+        fail("mount as your own account, not root")
+    conf, password = load()
+    address = link_address(conf["interface"])
+    if address is None:
+        fail("no other host answers on {}; is the cable connected?".format(conf["interface"]))
+    created = prepare_mountpoint(conf["mountpoint"], uid, gid)
+    # The scope is percent-encoded; mount_smbfs rejects a bare % in the URL.
+    url = "//{}@[{}%25{}]/{}".format(urllib.parse.quote(conf["user"], safe=""), address, conf["interface"],
+                                     urllib.parse.quote(conf["share"], safe=""))
+    code, output = mount_as(uid, gid, url, conf["mountpoint"], password)
+    if code != 0:
+        if created:
+            os.rmdir(conf["mountpoint"])
+        fail("mount_smbfs exited {}: {}".format(code, output.replace("\n", " ")[-300:]))
+    print("mounted //{}@{}/{} on {} over {}".format(conf["user"], address, conf["share"], conf["mountpoint"],
+                                                     conf["interface"]))
+
+
+if __name__ == "__main__":
+    main()

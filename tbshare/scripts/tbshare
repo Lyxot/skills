@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""tbshare: keep an SMB share mounted over the Thunderbolt link, and say how fast it reads.
+
+  tbshare status   which link carries the share, and its read speed
+  tbshare ensure   mount it over the link if it is not mounted, or remount it when it is
+                   on another link, the link reaches the server, and nothing has a file
+                   open on it; then check the speed
+
+The share is mounted by tbshare-mount, a root helper that holds the password; see
+install-tbshare-helper.sh. Speeds come from reading a large file on the share with the
+client's page cache bypassed, and the link from which interface's byte counter grew.
+
+Exit codes: 0 mounted over the link at speed; 3 not mounted; 4 mounted, but on another
+link or slower than TBSHARE_MIN_MBPS (default 500), and left as it is; 5 on another link
+and busy, so left alone; 6 the helper is not set up; 1 anything else.
+"""
+import argparse
+import configparser
+import fcntl
+import itertools
+import os
+import random
+import re
+import signal
+import subprocess
+import sys
+import time
+
+CONF = "/usr/local/etc/tbshare/config"
+HELPER = "/usr/local/libexec/tbshare-mount"
+MIN_MBPS = float(os.environ.get("TBSHARE_MIN_MBPS", "500"))
+READ_BYTES = 256 << 20
+CHUNK = 8 << 20
+READ_DEADLINE = 120
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+class Problem(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def log(message):
+    print("tbshare: " + message, file=sys.stderr)
+
+
+def setup_hint():
+    return ("the user sets it up once (agents can't, it needs sudo): sudo sh {}/scripts/install-tbshare-helper.sh"
+            " --share <share> --user <account>, then the NOPASSWD line it prints, with"
+            " sudo visudo -f /etc/sudoers.d/tbshare".format(SKILL_DIR))
+
+
+def load_conf():
+    parser = configparser.ConfigParser(interpolation=None)
+    if not parser.read(CONF) or "tbshare" not in parser:
+        raise Problem(6, "no {}; {}".format(CONF, setup_hint()))
+    return dict(parser["tbshare"])
+
+
+def interface_bytes():
+    """Bytes received so far by each interface."""
+    out = subprocess.run(["netstat", "-ibn"], capture_output=True, text=True, timeout=10).stdout
+    counts = {}
+    for line in out.splitlines()[1:]:
+        cols = line.split()
+        # Counted from the right: interfaces without a hardware address have no Address column.
+        if len(cols) >= 8 and cols[2].startswith("<Link"):
+            counts.setdefault(cols[0], int(cols[-5]))
+    return counts
+
+
+def probe_files(mountpoint, want, limit=5000):
+    """Files on the share large enough to time, in a bounded walk."""
+    seen = 0
+    for root, dirs, files in os.walk(mountpoint):
+        # Hidden directories hold indexes and metadata, not data a job would read.
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) >= want:
+                    yield path
+            except OSError:
+                pass
+        seen += len(files) + len(dirs)
+        if seen > limit:
+            return
+
+
+def timed_read(path, nbytes, offset=0):
+    """(bytes read, seconds), bypassing this Mac's page cache so a second read is not free."""
+    def stalled(signum, frame):
+        raise Problem(1, "a read from the share made no progress for {}s; its link may be down".format(READ_DEADLINE))
+
+    previous, fd = signal.signal(signal.SIGALRM, stalled), None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+        os.lseek(fd, offset, os.SEEK_SET)
+        got, start = 0, time.monotonic()
+        while got < nbytes:
+            # Per chunk, so a slow link is timed rather than taken for a dead one.
+            signal.alarm(READ_DEADLINE)
+            chunk = os.read(fd, min(CHUNK, nbytes - got))
+            if not chunk:
+                break
+            got += len(chunk)
+        return got, time.monotonic() - start
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+        if fd is not None:
+            os.close(fd)
+
+
+def measure(conf, nbytes=READ_BYTES, tries=5, pool=50):
+    """{"mbps", "link", "file", "bytes"} for an uncached read of nbytes from the share.
+
+    F_NOCACHE keeps a read from filling the page cache, not from hitting it, so a region
+    already cached moves no interface's counter; such a read is retried elsewhere. Files
+    and offsets are drawn at random, so the model a job just loaded cannot fill every try.
+    """
+    mountpoint = conf["mountpoint"]
+    candidates = list(itertools.islice(probe_files(mountpoint, nbytes), pool))
+    random.shuffle(candidates)
+    files = 0
+    for path in candidates[:tries]:
+        files += 1
+        try:
+            offset = random.randrange(0, os.path.getsize(path) - nbytes + 1) & ~((1 << 20) - 1)
+            before = interface_bytes()
+            got, seconds = timed_read(path, nbytes, offset)
+        except OSError:
+            continue
+        grew = {name: count - before.get(name, count) for name, count in interface_bytes().items()}
+        link, moved = max(grew.items(), key=lambda kv: kv[1], default=(None, 0))
+        if got and moved >= got // 2:
+            return {"mbps": got / 1e6 / seconds if seconds else 0.0, "link": link, "file": path, "bytes": got}
+        if files >= tries:
+            break
+    if not candidates:
+        raise Problem(1, "found no file of {} MB on {} to time its speed".format(nbytes >> 20, mountpoint))
+    raise Problem(1, "no read of {} came over the network (cached or unreadable), so its link is unknown;"
+                     " try again later".format(mountpoint))
+
+
+def verdict(conf, result):
+    if result["link"] != conf["interface"]:
+        return 4, "the share is read over {}, not {}".format(result["link"], conf["interface"])
+    if result["mbps"] < MIN_MBPS:
+        return 4, "the share reads at {:.0f} MB/s over {}, under {:.0f} MB/s".format(
+            result["mbps"], result["link"], MIN_MBPS)
+    return 0, "the share reads at {:.0f} MB/s over {}".format(result["mbps"], result["link"])
+
+
+def status(conf):
+    """(code, message, measurement)."""
+    if not os.path.ismount(conf["mountpoint"]):
+        raise Problem(3, "{} is not mounted".format(conf["mountpoint"]))
+    result = measure(conf)
+    code, message = verdict(conf, result)
+    return code, "{}: {} ({} MB of {})".format(conf["mountpoint"], message, result["bytes"] >> 20, result["file"]), result
+
+
+def link_reaches(conf):
+    """Whether exactly one other host answers on the configured link, as the helper requires to mount."""
+    interface = conf["interface"]
+    out = subprocess.run(["ping6", "-c", "3", "-i", "0.5", "-I", interface, "ff02::1"],
+                         capture_output=True, text=True, timeout=10).stdout
+    mine = subprocess.run(["ifconfig", interface], capture_output=True, text=True, timeout=5).stdout
+    own = set(re.findall(r"inet6 (fe80::[0-9a-f:]+)%", mine))
+    return len(set(re.findall(r"bytes from (fe80::[0-9a-f:]+)%{},".format(re.escape(interface)), out)) - own) == 1
+
+
+def open_files(mountpoint):
+    try:
+        out = subprocess.run(["lsof", "-Fpcn", mountpoint], capture_output=True, text=True, timeout=60).stdout
+    except subprocess.TimeoutExpired:
+        raise Problem(1, "lsof did not finish listing open files on {}; left it as it is".format(mountpoint))
+    return sorted({line[1:] for line in out.splitlines() if line.startswith("c")})
+
+
+def helper_allowed():
+    """Whether a NOPASSWD rule lets this account run the helper.
+
+    `sudo -l <command>` cannot answer it: an account that may run anything with a password
+    is told yes. The rule list itself says which commands need none.
+    """
+    if not os.path.exists(HELPER):
+        return False
+    rules = subprocess.run(["sudo", "-n", "-l"], capture_output=True, text=True, timeout=30).stdout
+    return any("NOPASSWD:" in line and HELPER in line.split("NOPASSWD:", 1)[1] for line in rules.splitlines())
+
+
+def ensure(conf):
+    mountpoint = conf["mountpoint"]
+    if os.path.ismount(mountpoint):
+        code, message, result = status(conf)
+        # A remount over the same link reads no faster.
+        if code == 0 or result["link"] == conf["interface"]:
+            return code, message
+        log(message)
+        if not link_reaches(conf):
+            raise Problem(4, "left {} as it is: not exactly one other host answers on {}; is the cable connected?".format(
+                mountpoint, conf["interface"]))
+        busy = open_files(mountpoint)
+        if busy:
+            raise Problem(5, "left {} as it is: {} have files open on it".format(mountpoint, ", ".join(busy)))
+        # Agents cannot mount it back, so nothing is unmounted unless the helper can run.
+        if not helper_allowed():
+            raise Problem(6, "left {} as it is: {} is not set up; {}".format(mountpoint, HELPER, setup_hint()))
+        unmount = subprocess.run(["diskutil", "unmount", mountpoint], capture_output=True, text=True, timeout=60)
+        if unmount.returncode:
+            raise Problem(1, "cannot unmount {}: {}".format(mountpoint, (unmount.stderr or unmount.stdout).strip()))
+        log("unmounted {} to mount it over {}".format(mountpoint, conf["interface"]))
+    helper = subprocess.run(["sudo", "-n", HELPER], capture_output=True, text=True, timeout=120)
+    if helper.returncode:
+        text = (helper.stderr or helper.stdout).strip()
+        if not helper_allowed():
+            raise Problem(6, "cannot run {} ({}); {}".format(HELPER, text, setup_hint()))
+        raise Problem(1, "{}; {} is not mounted now".format(text, mountpoint))
+    log(helper.stdout.strip())
+    return status(conf)[:2]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("action", choices=["status", "ensure"])
+    args = parser.parse_args()
+    try:
+        conf = load_conf()
+        code, message = status(conf)[:2] if args.action == "status" else ensure(conf)
+    except Problem as p:
+        log(str(p))
+        return p.code
+    print(message)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
