@@ -53,6 +53,10 @@ Optional, outermost call only, never for correctness tests:
 
 The fans need a one-time setup by the user (agents can't sudo): `sudo sh <skill dir>/scripts/install-fan-helper.sh`, then the `NOPASSWD` line it prints. Until then `--stable` runs with automatic fans and says so.
 
+## Priority
+
+`--priority N` (default 0) lets a job go first: while it waits for a slot, jobs with a lower priority that need that slot do not start, and none raises a barrier against it. Equal priorities keep the usual order, and running jobs are never stopped. Set it only when the user asks for a job to go first; everyone else leaves it at 0, or priorities stop meaning anything.
+
 ## User override
 
 Only when the user explicitly tells you to take the machine for a job, add `--user-override` with their instruction word for word:
@@ -65,7 +69,7 @@ It kills every job holding a slot this job needs (they exit 78) and starts at on
 
 ## Status and exit codes
 
-`hwgate status` shows heat, battery, budget, each slot and its jobs, the jobs waiting to start (by arrival; new sharers hold back for a job waiting for a whole slot, which is marked), and each running job with its pid and command (`--full` for whole commands). `hwgate:` lines on stderr say why a job waits.
+`hwgate status` shows heat, battery, budget, each slot and its jobs, the jobs waiting to start (by priority, then arrival; new sharers hold back for a job waiting for a whole slot, which is marked), and each running job with its pid and command (`--full` for whole commands). `hwgate:` lines on stderr say why a job waits.
 
 | Code | Meaning | What to do |
 |---|---|---|
@@ -82,6 +86,7 @@ It kills every job holding a slot this job needs (they exit 78) and starts at on
 
 - Never run gated work outside `hwgate` because a slot is busy. Wait or retry.
 - Never pass `--user-override` without the user's explicit, verbatim instruction for that takeover.
+- Never raise `--priority` unless the user asked for that job to go first.
 - Never under-declare `--cpus`.
 - Never set `HWGATE_FORCE_*`, `HWGATE_STATE_DIR` or `HWGATE_TOP_CLOCK_MIN_ACTIVE` outside hwgate's own tests.
 - Don't wrap commands that leave a background process behind: it is killed when the job returns.

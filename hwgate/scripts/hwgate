@@ -29,7 +29,9 @@ Jobs share a slot: up to SLOT_PARALLEL of them hold one at a time, because work
 that is not being timed loses little to running alongside other work. --stable is
 what asks for the machine alone, and heat does the same thing for every job. A
 job waiting for a whole slot raises a barrier, so overlapping sharers cannot
-starve it. A job admitted onto a slot that others already hold is told which
+starve it. --priority N (default 0) orders waiters: a job does not start while
+one with a higher priority waits for a slot it needs, and drops any barrier it
+holds; equal priorities keep the order above. A job admitted onto a slot that others already hold is told which
 ones, because sharing is the one admission outcome that changes how the job runs
 without making it wait, and nothing else in its output would reveal it.
 
@@ -1161,7 +1163,7 @@ def preempt(slots, instruction, handled):
         kill_group(lease["pgid"], signal.SIGKILL)
 
 
-def try_admit(requested, want, held, state, stable, barriers, override=False):
+def try_admit(requested, want, held, state, stable, barriers, override=False, priority=0):
     """One attempt. Returns (slot fds, (lease fd, path), shared slots, refusal).
 
     Every refusal leaves through refuse(), so no path can keep a barrier it is no
@@ -1185,6 +1187,16 @@ def try_admit(requested, want, held, state, stable, barriers, override=False):
         if not locked:
             return refuse("another hwgate has held the admission lock for over {:.0f}s".format(ADMIT_WAIT))
         leases = scan_leases(reap=True)
+        # A nested job never stands behind a barrier or a higher priority: whoever raised
+        # it may be waiting on this job's own parent. The cost is that a parent starting
+        # sharers back to back can keep a waiter out for as long as it runs.
+        nested = bool(held) or inside_gated_job(leases)
+        if not override and not nested:
+            for waiter in read_queue():
+                # Checked before any barrier is raised, so a refusal here drops this job's barriers.
+                if waiter.get("priority", 0) > priority and set(waiter.get("needs", ())) & need:
+                    return refuse("pid {} has priority {} and goes first".format(
+                        waiter.get("pid"), waiter.get("priority")))
         used_cpus = sum(lease["cpus"] for lease in leases)
         # A job taking the cpu slot whole is answered by the lock below, never the budget:
         # only a lock refusal raises its barrier, and without one sharers declaring cores
@@ -1198,10 +1210,6 @@ def try_admit(requested, want, held, state, stable, barriers, override=False):
             if taken >= SLOT_PARALLEL:
                 return refuse("{} slot is full: {} of {} jobs{}".format(
                     slot, taken, SLOT_PARALLEL, holder_summary(slot, leases)))
-        # A nested job never stands behind a barrier: whoever raised it may be
-        # waiting on this job's own parent. The cost is that a parent starting
-        # sharers back to back can keep a waiter out for as long as it runs.
-        nested = bool(held) or inside_gated_job(leases)
         for slot in sorted(share if not nested else ()):
             holder = barrier_holder(slot)
             if holder:
@@ -1284,7 +1292,7 @@ def read_queue():
     return sorted(waiters, key=lambda w: w.get("since", 0))
 
 
-def acquire(requested, want, held, max_wait, stable, override=None, queued=None):
+def acquire(requested, want, held, max_wait, stable, override=None, queued=None, priority=0):
     start = time.time()
     delay = 1.0
     last_key, last_logged = None, 0.0
@@ -1311,7 +1319,7 @@ def acquire(requested, want, held, max_wait, stable, override=None, queued=None)
                 sync_barriers(barriers, set())
             else:
                 fds, lease_fd, share, reason = try_admit(
-                    requested, want, held, state, stable, barriers, override=bool(override))
+                    requested, want, held, state, stable, barriers, override=bool(override), priority=priority)
                 if reason is None:
                     return fds, lease_fd, share, state
             # Reasons carry running counters ("held ... for 668s"), which change every poll.
@@ -1323,7 +1331,7 @@ def acquire(requested, want, held, max_wait, stable, override=None, queued=None)
                 record = dict(queued or {}, pid=os.getpid(), since=start, reason=reason,
                               needs=sorted(set(SLOTS) if stable or (state >= FAIR and not override)
                                            else set(requested)), stable=stable,
-                              override=bool(override),
+                              override=bool(override), priority=priority,
                               ahead=bool(barriers))
                 try:
                     if entry is None:
@@ -1537,7 +1545,8 @@ def cmd_run(args):
     want = max(0, want - held_cpus)
 
     fds, lease, share, state = acquire(needs, want, held, args.max_wait, args.stable, override,
-                                       queued={"cmd": " ".join(command), "cwd": os.getcwd()})
+                                       queued={"cmd": " ".join(command), "cwd": os.getcwd()},
+                                       priority=args.priority)
     if fds is None:
         log("gave up after waiting {}s; nothing was started".format(args.max_wait))
         return EXIT_GAVE_UP
@@ -1804,17 +1813,19 @@ def cmd_status(args):
             jobs.setdefault(lease.get("child_pid") or lease["path"], lease)
 
     now = time.time()
-    waiters = read_queue()
+    waiters = sorted(read_queue(), key=lambda w: -w.get("priority", 0))
     if waiters:
         print()
         # Waiters retry every second or two and whichever asks first once a slot frees gets it,
-        # so arrival is all that can be shown; only a barrier changes who goes first.
-        print("queue: {} waiting{}".format(len(waiters), ", by arrival; there is no fixed order: whoever asks first"
-                                           " once a slot frees gets it, except that new sharers hold back for a job"
-                                           " waiting for a whole slot" if len(waiters) > 1 else ""))
+        # so arrival is all that can be shown; only a priority or a barrier changes who goes first.
+        print("queue: {} waiting{}".format(len(waiters), ", by priority, then arrival; within a priority there is no"
+                                           " fixed order: whoever asks first once a slot frees gets it, except that"
+                                           " new sharers hold back for a job waiting for a whole slot"
+                                           if len(waiters) > 1 else ""))
         for waiter in waiters:
             bits = [paint("--user-override", "red")] if waiter.get("override") else []
             bits += [paint("--stable", "bold")] if waiter.get("stable") else []
+            bits += [paint("priority {}".format(waiter["priority"]), "bold")] if waiter.get("priority") else []
             bits.append("needs " + "+".join(s for s in SLOTS if s in waiter.get("needs", ())))
             bits.append("waiting " + duration(now - waiter.get("since", now)))
             if waiter.get("ahead"):
@@ -1855,6 +1866,7 @@ def main():
     run.add_argument("--needs", type=parse_slots, required=True, help="gpu, cpu, or gpu,cpu")
     run.add_argument("--cpus", type=positive_int, help="cores this job will use: charges that many to the cpu budget instead of a share of the pool, so honest declarations fit more work on the machine")
     run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds before the job is killed; 0 disables (default %(default)s)")
+    run.add_argument("--priority", type=int, default=0, help="while a waiting job with a higher priority needs a slot this job needs, this one does not start; equal priorities keep the usual order (default %(default)s)")
     run.add_argument("--max-wait", type=float, default=0, help="seconds to wait for admission before exiting 75; 0 waits forever")
     run.add_argument("--stable", action="store_true", help="needs stable performance: start alone at nominal after a cooldown and with no Time Machine backup running, abort with 76 once throttled or a backup starts")
     run.add_argument("--throttle-budget", type=float, default=DEFAULT_THROTTLE_BUDGET, help="--stable: seconds of continuous throttling (heat plus a frequency drop) tolerated before aborting (default %(default)s)")

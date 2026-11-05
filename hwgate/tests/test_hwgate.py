@@ -605,7 +605,7 @@ def test_status_lists_waiting_jobs_by_arrival_and_tags_whole_slot_takers(gate):
     older = wait_in_line("--max-wait", "30", "--", "echo", "older")
     wait_for_status(gate, "queue: 1 waiting")
     whole = wait_in_line("--stable", "--max-wait", "30", "--", "echo", "whole")
-    status = wait_for_status(gate, "queue: 2 waiting, by arrival; there is no fixed order")
+    status = wait_for_status(gate, "queue: 2 waiting, by priority, then arrival; within a priority there is no fixed order")
     try:
         lines = status.splitlines()
         first = next(i for i, line in enumerate(lines) if line.startswith("  pid {}:".format(older.pid)))
@@ -1727,3 +1727,73 @@ def test_an_abandoned_job_is_reaped_only_when_ps_identifies_it(monkeypatch, reco
     module.reap_abandoned({"deadline": 1, "wrapper_pid": 111, "pgid": 222, "child_pid": 222,
                            "child_start": recorded}, "gpu job")
     assert killed == ([222] if reaped else [])
+
+
+def queued_waiter(gate, *args, **extra):
+    """A hwgate run that waits in the queue, returned once status lists it."""
+    proc = subprocess.Popen([sys.executable, str(HWGATE), "run", *args], env=gate.environ(**extra),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wait_for_status(gate, "  pid {}:".format(proc.pid))
+    return proc
+
+
+def test_a_waiting_higher_priority_job_holds_back_jobs_needing_its_slots(gate):
+    """The stable waiter needs both slots and waits on a cpu sharer, so the gpu is free."""
+    gate.background("run", "--needs", "cpu", "--cpus", "1", "--", "sleep", "20")
+    high = queued_waiter(gate, "--needs", "gpu", "--stable", "--priority", "1", "--max-wait", "25", "--", "true",
+                         HWGATE_COOLDOWN=0)
+    try:
+        low = gate("run", "--needs", "gpu", "--max-wait", "0.5", "--", "echo", "ran")
+        assert low.returncode == 75 and "pid {} has priority 1 and goes first".format(high.pid) in low.stderr, low.stderr
+        equal = gate("run", "--needs", "gpu", "--priority", "1", "--max-wait", "0.5", "--", "echo", "ran")
+        assert equal.returncode == 0 and "ran" in equal.stdout, equal.stderr
+        # A nested job is exempt: whoever outranks it may be waiting on its own parent.
+        nested = gate("run", "--needs", "gpu,cpu", "--max-wait", "0.5", "--", "echo", "ran", HWGATE_HELD="cpu")
+        assert nested.returncode == 0 and "ran" in nested.stdout, nested.stderr
+        # And so is the user's override, which starts past every queue check.
+        override = gate("run", "--needs", "gpu", "--max-wait", "5", "--user-override", "now", "--", "echo", "ran")
+        assert override.returncode == 0 and "ran" in override.stdout, override.stderr
+    finally:
+        high.kill()
+        high.wait()
+
+
+def test_a_higher_priority_waiter_does_not_hold_back_other_slots(gate):
+    for _ in range(3):
+        gate.background("run", "--needs", "gpu", "--", "sleep", "20")
+    high = queued_waiter(gate, "--needs", "gpu", "--priority", "5", "--max-wait", "25", "--", "true")
+    try:
+        other = gate("run", "--needs", "cpu", "--cpus", "1", "--max-wait", "0.5", "--", "echo", "ran")
+        assert other.returncode == 0 and "ran" in other.stdout, other.stderr
+    finally:
+        high.kill()
+        high.wait()
+
+
+def test_a_lower_priority_barrier_gives_way_to_a_higher_priority_sharer(gate):
+    gate.background("run", "--needs", "cpu", "--cpus", "1", "--", "sleep", "20")
+    low = subprocess.Popen([sys.executable, str(HWGATE), "run", "--needs", "cpu", "--stable", "--max-wait", "25",
+                            "--", "true"], env=gate.environ(HWGATE_COOLDOWN=0),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_for_barrier(gate, "cpu")
+        high = gate("run", "--needs", "cpu", "--cpus", "1", "--priority", "1", "--max-wait", "15", "--", "echo", "ran")
+        assert high.returncode == 0 and "ran" in high.stdout, high.stderr
+    finally:
+        low.kill()
+        low.wait()
+
+
+def test_status_lists_waiters_by_priority(gate):
+    gate.background("run", "--needs", "gpu", "--stable", "--", "sleep", "20", HWGATE_COOLDOWN=0)
+    first = queued_waiter(gate, "--needs", "gpu", "--max-wait", "25", "--", "true")
+    second = queued_waiter(gate, "--needs", "gpu", "--priority", "2", "--max-wait", "25", "--", "true")
+    try:
+        status = wait_for_status(gate, "queue: 2 waiting")
+        assert status.index("pid {}:".format(second.pid)) < status.index("pid {}:".format(first.pid)), status
+        line = next(line for line in status.splitlines() if "pid {}:".format(second.pid) in line)
+        assert "priority 2" in line and "by priority, then arrival" in status, status
+    finally:
+        for proc in (first, second):
+            proc.kill()
+            proc.wait()
