@@ -970,8 +970,19 @@ def test_stable_waits_longer_after_heat_than_other_jobs_do(gate, tmp_path):
 def test_a_low_battery_that_is_not_charging_refuses_at_once(gate):
     # No --max-wait: a refusal must not turn into a wait.
     result = gate("run", "--needs", "gpu", "--", "echo", "ran", HWGATE_FORCE_BATTERY="34,0")
-    assert result.returncode == 77 and "plugged in" in result.stderr, result.stderr
+    assert result.returncode == 77 and "until the Mac is on power" in result.stderr, result.stderr
     assert "ran" not in result.stdout
+
+
+def test_on_power_with_the_battery_not_charging_nothing_waits(gate):
+    """A charge limit or paused charging: the adapter carries the load, so the level does not fall."""
+    run = lambda reading: gate("run", "--needs", "cpu", "--max-wait", "1", "--", "echo", "ran",
+                               HWGATE_FORCE_BATTERY=reading)
+    result = run("20,power")
+    assert result.returncode == 0 and "ran" in result.stdout, result.stderr
+    # Not even a recovery a charging reading started.
+    assert run("34,1").returncode == 75
+    assert run("40,power").returncode == 0
 
 
 @pytest.mark.parametrize("level, code", [("34", 75), ("40", 75), ("49", 75), ("50", 0)])
@@ -1012,7 +1023,8 @@ def test_a_job_waiting_for_the_battery_follows_the_next_reading(gate, tmp_path, 
 
 
 def test_status_reports_the_battery(gate):
-    assert "battery: 80%, not charging" in gate("status", HWGATE_FORCE_BATTERY="80,0").stdout
+    assert "battery: 80%, on battery" in gate("status", HWGATE_FORCE_BATTERY="80,0").stdout
+    assert "battery: 80%, on power, not charging" in gate("status", HWGATE_FORCE_BATTERY="80,power").stdout
     assert "battery" not in gate("status").stdout
     # Reporting a low reading must not start a recovery a job would then wait out.
     assert "jobs wait for 50%" in gate("status", HWGATE_FORCE_BATTERY="34,1").stdout
@@ -1020,10 +1032,20 @@ def test_status_reports_the_battery(gate):
 
 
 @pytest.mark.parametrize("reply, reading", [
-    (plistlib.dumps([{"CurrentCapacity": 39, "MaxCapacity": 100, "IsCharging": True}]), (39.0, True)),
-    (plistlib.dumps([{"CurrentCapacity": 4000, "MaxCapacity": 5000, "IsCharging": False}]), (80.0, False)),
+    (plistlib.dumps([{"CurrentCapacity": 39, "MaxCapacity": 100, "IsCharging": True,
+                      "ExternalConnected": True}]), (39.0, "charging")),
+    (plistlib.dumps([{"CurrentCapacity": 4000, "MaxCapacity": 5000, "IsCharging": False}]), (80.0, "battery")),
+    (plistlib.dumps([{"CurrentCapacity": 80, "MaxCapacity": 100, "IsCharging": False, "ExternalConnected": True,
+                      "Amperage": 0}]), (80.0, "power")),
+    (plistlib.dumps([{"CurrentCapacity": 30, "MaxCapacity": 100, "IsCharging": False, "ExternalConnected": True,
+                      "Amperage": -900}]), (30.0, "battery")),
+    (plistlib.dumps([{"CurrentCapacity": 30, "MaxCapacity": 100, "IsCharging": False, "ExternalConnected": True,
+                      "Amperage": (1 << 64) - 900}]), (30.0, "battery")),
+    (plistlib.dumps([{"CurrentCapacity": 30, "MaxCapacity": 100, "IsCharging": False, "ExternalConnected": False,
+                      "Amperage": 0}]), (30.0, "battery")),
     (b"", None),
-], ids=["percent", "mAh", "no-battery"])
+], ids=["charging", "mAh-on-battery", "on-power-holding", "plugged-in-draining", "draining-unsigned",
+        "unplugged-idle", "no-battery"])
 def test_the_battery_is_read_from_ioreg(monkeypatch, reply, reading):
     module = load_hwgate()
     monkeypatch.delenv("HWGATE_FORCE_BATTERY", raising=False)

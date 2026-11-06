@@ -13,8 +13,10 @@ Slot policy, decided by the macOS thermal state when a job asks to start:
 Running jobs are not stopped for heat: finishing costs less than restarting.
 
 Battery, on a Mac that has one: below BATTERY_MIN percent a new job is refused
-with exit 77 unless the battery is charging; a charging one makes every new job
-wait until it is back to BATTERY_RESUME. Running jobs are not stopped.
+with exit 77 while the Mac runs on battery; a charging one makes every new job
+wait until it is back to BATTERY_RESUME. On power with the battery holding its
+level (a charge limit, or charging paused), nothing waits. Running jobs are not
+stopped.
 
 --user-override INSTRUCTION is the user's way past all of this, and only the
 user's: an agent passes it only when the user explicitly told it to take the
@@ -103,8 +105,8 @@ Usage:
 
 Exit codes: the job's own code; 124 on timeout; 75 when --max-wait ran out
 before the job could start; 76 when a --stable job was aborted for
-throttling; 77 when a low battery that is not
-charging refused the job; 78 when a --user-override killed the job; 79 when
+throttling; 77 when a low battery, on battery
+power, refused the job; 78 when a --user-override killed the job; 79 when
 a --min-top-clock-residency run was not certified at the GPU's top clock; 2 on
 bad usage or a request larger than the machine's budget.
 """
@@ -339,22 +341,31 @@ def read_thermal():
 
 
 def battery():
-    """(percent, charging) of the internal battery; None on a Mac without one, or when unreadable."""
+    """(percent, source) of the internal battery, source being "charging", "power" (plugged in,
+    the battery neither charging nor draining) or "battery"; None on a Mac without one, or when unreadable."""
     forced = os.environ.get("HWGATE_FORCE_BATTERY")
     if forced is not None:
-        # Tests pass "<percent>,<charging 0|1>" or "none", or a file path so the reading can change mid-wait.
+        # Tests pass "<percent>,<1 charging|0 battery|power>" or "none", or a file path so the
+        # reading can change mid-wait.
         if os.sep in forced:
             with open(forced) as f:
                 forced = f.read().strip()
         if forced == "none":
             return None
-        level, charging = forced.split(",")
-        return float(level), charging == "1"
+        level, source = forced.split(",")
+        return float(level), {"1": "charging", "0": "battery"}.get(source, source)
     try:
         out = subprocess.run(["ioreg", "-rn", "AppleSmartBattery", "-a"], capture_output=True, check=True,
                              timeout=2).stdout
         props = plistlib.loads(out)[0]
-        return 100.0 * props["CurrentCapacity"] / props["MaxCapacity"], bool(props.get("IsCharging"))
+        level = 100.0 * props["CurrentCapacity"] / props["MaxCapacity"]
+        if props.get("IsCharging"):
+            return level, "charging"
+        # Signed milliamps, which some readers give as an unsigned 64-bit value. Plugged into an
+        # adapter too weak for the load, the battery still drains, so that counts as on battery.
+        amperage = props.get("Amperage", 0)
+        amperage -= 1 << 64 if amperage >= 1 << 63 else 0
+        return level, "power" if props.get("ExternalConnected") and amperage >= 0 else "battery"
     except Exception:
         return None
 
@@ -362,13 +373,15 @@ def battery():
 def battery_hold(reading, record=True):
     """(why the battery keeps a new job from starting, whether it refuses rather than waits), or (None, False).
 
-    Below BATTERY_MIN a job is refused unless the battery is charging, and then it
+    Below BATTERY_MIN a job on battery is refused, and one on a charging battery
     waits until BATTERY_RESUME. The marker makes that recovery machine-wide, so a
     job arriving midway cannot start ahead of one already waiting and slow the charge.
+    On power with the battery not charging, the adapter carries the load, so
+    nothing is held back.
     """
     if reading is None:
         return None, False
-    level, charging = reading
+    level, source = reading
     marker = os.path.join(STATE_DIR, "battery_low")
     low = level < BATTERY_MIN
     if record and low:
@@ -376,13 +389,13 @@ def battery_hold(reading, record=True):
     elif record and level >= BATTERY_RESUME:
         with contextlib.suppress(FileNotFoundError):
             os.remove(marker)
-    if level >= BATTERY_RESUME or not (low or os.path.exists(marker)):
+    if source == "power" or level >= BATTERY_RESUME or not (low or os.path.exists(marker)):
         return None, False
-    if charging:
+    if source == "charging":
         return "battery at {:.0f}% and charging; jobs wait for {:.0f}% after it fell below {:.0f}%".format(
             level, BATTERY_RESUME, BATTERY_MIN), False
     if low:
-        return "battery at {:.0f}% and not charging; jobs are refused below {:.0f}% until the Mac is plugged in".format(
+        return "battery at {:.0f}% and draining; jobs are refused below {:.0f}% until the Mac is on power".format(
             level, BATTERY_MIN), True
     return None, False
 
@@ -1718,7 +1731,7 @@ def cmd_status(args):
     if reading:
         hold, refused = battery_hold(reading, record=False)
         print(paint(hold, "red" if refused else "yellow") if hold else "battery: {:.0f}%, {}".format(
-            reading[0], "charging" if reading[1] else "not charging"))
+            reading[0], {"charging": "charging", "power": "on power, not charging"}.get(reading[1], "on battery")))
     ceilings = freq_ceilings()
     if ceilings:
         print("hardware max: " + ", ".join("{} {:.0f} MHz".format(s, ceilings[s]) for s in sorted(ceilings)))

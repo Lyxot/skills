@@ -26,7 +26,7 @@ hwgate run --needs cpu --cpus 4 --max-wait 300 -- python -m pytest -n 4 tests/
 - Up to three jobs share a slot. A job that joins a busy slot prints the jobs already on it; quote that line next to any duration from a shared run.
 - `--cpus <n>` charges `n` cores of the budget and exports `HWGATE_CPUS` and `OMP_NUM_THREADS`. Pass the same `n` to `pytest -n`, never `auto`. Undeclared cpu jobs are charged a third of the budget.
 - Heat: at fair, one heavy job at a time; at serious or worse, nothing starts until 60s after it clears. Running jobs are never stopped for heat.
-- Battery: below 35% and not charging, exit 77; while charging, new jobs wait for 50%.
+- Battery: below 35% on battery, exit 77; while charging, new jobs wait for 50%. Plugged in with the battery not charging (a charge limit, or charging paused), nothing waits.
 - `--timeout` (default 7200s) kills the job's process group, as does the job exiting. A gated job calling `hwgate` again reuses its slots.
 - There is no memory flag: GPU memory is wired, so size large models yourself, and use `--stable` to have the GPU alone.
 
@@ -76,7 +76,7 @@ It kills every job holding a slot this job needs (they exit 78) and starts at on
 | the job's own | the job ran | read its output |
 | 75 | `--max-wait` ran out; nothing started | check `hwgate status`, retry later |
 | 76 | `--stable` aborted: throttling or `--min-freq-ratio` | discard partial numbers; rerun, it waits for the cooldown |
-| 77 | battery below 35%, not charging | tell the user the Mac needs power |
+| 77 | battery below 35%, on battery | tell the user the Mac needs power |
 | 78 | killed by the user's `--user-override` | discard partial results; rerun once, it waits |
 | 79 | `--min-top-clock-residency` not met, or not measurable | the reason is logged; report the numbers as unqualified |
 | 124 | the job hit `--timeout` | it hung, or needs a longer `--timeout` |
