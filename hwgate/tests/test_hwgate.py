@@ -1036,7 +1036,7 @@ def test_status_reports_the_battery(gate):
                       "ExternalConnected": True}]), (39.0, "charging")),
     (plistlib.dumps([{"CurrentCapacity": 4000, "MaxCapacity": 5000, "IsCharging": False}]), (80.0, "battery")),
     (plistlib.dumps([{"CurrentCapacity": 80, "MaxCapacity": 100, "IsCharging": False, "ExternalConnected": True,
-                      "Amperage": 0}]), (80.0, "power")),
+                      "Amperage": -17}]), (80.0, "power")),
     (plistlib.dumps([{"CurrentCapacity": 30, "MaxCapacity": 100, "IsCharging": False, "ExternalConnected": True,
                       "Amperage": -900}]), (30.0, "battery")),
     (plistlib.dumps([{"CurrentCapacity": 30, "MaxCapacity": 100, "IsCharging": False, "ExternalConnected": True,
@@ -1044,7 +1044,7 @@ def test_status_reports_the_battery(gate):
     (plistlib.dumps([{"CurrentCapacity": 30, "MaxCapacity": 100, "IsCharging": False, "ExternalConnected": False,
                       "Amperage": 0}]), (30.0, "battery")),
     (b"", None),
-], ids=["charging", "mAh-on-battery", "on-power-holding", "plugged-in-draining", "draining-unsigned",
+], ids=["charging", "mAh-on-battery", "on-power-holding-near-zero", "plugged-in-draining", "draining-unsigned",
         "unplugged-idle", "no-battery"])
 def test_the_battery_is_read_from_ioreg(monkeypatch, reply, reading):
     module = load_hwgate()

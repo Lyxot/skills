@@ -161,6 +161,9 @@ DEFAULT_THROTTLE_BUDGET = 10.0
 # Battery percent below which a job is refused, and the level a charging battery must regain.
 BATTERY_MIN = 35.0
 BATTERY_RESUME = 50.0
+# Milliamps out of the battery, while plugged in, that count as draining. A battery held at its
+# charge limit reads a few tens either side of zero (-17 seen); an adapter too weak for the load, hundreds.
+BATTERY_DRAIN_MA = 200
 ADMIT_WAIT = 10.0
 # A wait whose reason has not changed is repeated this often, so a long one does not look hung.
 WAIT_REMINDER = 60.0
@@ -365,7 +368,7 @@ def battery():
         # adapter too weak for the load, the battery still drains, so that counts as on battery.
         amperage = props.get("Amperage", 0)
         amperage -= 1 << 64 if amperage >= 1 << 63 else 0
-        return level, "power" if props.get("ExternalConnected") and amperage >= 0 else "battery"
+        return level, "power" if props.get("ExternalConnected") and amperage > -BATTERY_DRAIN_MA else "battery"
     except Exception:
         return None
 
