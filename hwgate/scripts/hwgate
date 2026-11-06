@@ -68,8 +68,6 @@ Stable-performance jobs (--stable: benchmarks, timing or throughput runs):
     rather than passed. The counters are machine-wide, and the window includes
     loading and warmup. A job that fails keeps its own exit status. The
     report adds GPU_CLTM residency (the thermal manager) as evidence only;
-  - wait to start while a Time Machine backup runs, and are killed with 76
-    once one starts (checked every BACKUP_POLL seconds);
   - run with every fan pinned at its maximum, handed back to macOS when the
     job exits, through `sudo -n` on a root helper that
     scripts/install-fan-helper.sh installs and a NOPASSWD rule allows;
@@ -105,7 +103,7 @@ Usage:
 
 Exit codes: the job's own code; 124 on timeout; 75 when --max-wait ran out
 before the job could start; 76 when a --stable job was aborted for
-throttling or a Time Machine backup; 77 when a low battery that is not
+throttling; 77 when a low battery that is not
 charging refused the job; 78 when a --user-override killed the job; 79 when
 a --min-top-clock-residency run was not certified at the GPU's top clock; 2 on
 bad usage or a request larger than the machine's budget.
@@ -158,8 +156,6 @@ STABLE_SPLIT_HINT = float(os.environ.get("HWGATE_STABLE_SPLIT_HINT", "600"))
 # Pins the fans at maximum for a --stable run once install-fan-helper.sh has run; empty disables.
 FAN_CMD = os.environ.get("HWGATE_FAN_CMD", "sudo -n /usr/local/libexec/hwgate-fan").split()
 DEFAULT_THROTTLE_BUDGET = 10.0
-# Seconds between Time Machine checks during a --stable run; each one starts tmutil.
-BACKUP_POLL = 5.0
 # Battery percent below which a job is refused, and the level a charging battery must regain.
 BATTERY_MIN = 35.0
 BATTERY_RESUME = 50.0
@@ -340,22 +336,6 @@ def read_thermal():
     state = thermal_state()
     return (state, _cooldown_left("last_hot", state >= SERIOUS, COOLDOWN),
             _cooldown_left("last_warm", state >= FAIR, STABLE_COOLDOWN))
-
-
-def backup_running():
-    """Whether a Time Machine backup is running; unreadable reads as no, so a Mac without one is never held up."""
-    forced = os.environ.get("HWGATE_FORCE_BACKUP")
-    if forced is not None:
-        # Tests pass a digit, or a file path so the reading can change mid-run.
-        if not forced.isdigit():
-            with open(forced) as f:
-                forced = f.read().strip()
-        return forced == "1"
-    try:
-        out = subprocess.run(["tmutil", "status", "-X"], capture_output=True, check=True, timeout=2).stdout
-        return bool(plistlib.loads(out).get("Running"))
-    except Exception:
-        return False
 
 
 def battery():
@@ -1311,8 +1291,6 @@ def acquire(requested, want, held, max_wait, stable, override=None, queued=None,
                     sys.exit(EXIT_LOW_BATTERY)
                 state, cooldown, warm_cooldown = read_thermal()
                 reason = hold or too_hot_to_start(state, cooldown, warm_cooldown, stable)
-                if reason is None and stable and backup_running():
-                    reason = "a Time Machine backup is running; --stable waits for it to finish"
             if reason is not None:
                 # Held up by heat rather than by a sharer, so nothing is owed a
                 # barrier; try_admit keeps its own.
@@ -1594,7 +1572,6 @@ def cmd_run(args):
         signal.signal(sig, forward)
 
     watch = ThrottleWatch(needs, args.throttle_budget, args.min_freq_ratio) if args.stable else None
-    next_backup_check = 0.0
     try:
         while True:
             try:
@@ -1609,21 +1586,13 @@ def cmd_run(args):
                 # Read every run, so heat caused by any job delays the next --stable one.
                 now_state = read_thermal()[0]
                 reason = watch.check(now_state) if watch else None
-                if reason:
-                    why = "{}, budget {:.0f}s".format(reason, args.throttle_budget)
-                    wait = "waits {:.0f}s of cooldown at nominal first".format(STABLE_COOLDOWN)
-                elif watch and time.time() >= next_backup_check:
-                    next_backup_check = time.time() + BACKUP_POLL
-                    if not backup_running():
-                        continue
-                    why = "a Time Machine backup started, and its disk and CPU load skew timings"
-                    wait = "holds the rerun until the backup finishes"
-                else:
+                if not reason:
                     continue
                 log(
-                    "ABORTED --stable job after {:.0f}s: {}. "
+                    "ABORTED --stable job after {:.0f}s: {}, budget {:.0f}s. "
                     "It did not get stable performance, so treat its partial results as invalid. "
-                    "Rerun it; hwgate {}.".format(time.time() - info["started"], why, wait)
+                    "Rerun it; hwgate waits {:.0f}s of cooldown at nominal first.".format(
+                        time.time() - info["started"], reason, args.throttle_budget, STABLE_COOLDOWN)
                 )
                 terminate(proc)
                 rc = EXIT_UNSTABLE
@@ -1745,8 +1714,6 @@ def cmd_status(args):
     elif warm_cooldown > 0 and state == NOMINAL:
         line += " (--stable admits in {:.0f}s)".format(warm_cooldown)
     print(line)
-    if backup_running():
-        print(paint("time machine: backing up; --stable waits for it to finish", "yellow"))
     reading = battery()
     if reading:
         hold, refused = battery_hold(reading, record=False)
@@ -1868,7 +1835,7 @@ def main():
     run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds before the job is killed; 0 disables (default %(default)s)")
     run.add_argument("--priority", type=int, default=0, help="while a waiting job with a higher priority needs a slot this job needs, this one does not start; equal priorities keep the usual order (default %(default)s)")
     run.add_argument("--max-wait", type=float, default=0, help="seconds to wait for admission before exiting 75; 0 waits forever")
-    run.add_argument("--stable", action="store_true", help="needs stable performance: start alone at nominal after a cooldown and with no Time Machine backup running, abort with 76 once throttled or a backup starts")
+    run.add_argument("--stable", action="store_true", help="needs stable performance: start alone at nominal after a cooldown, abort with 76 once throttled")
     run.add_argument("--throttle-budget", type=float, default=DEFAULT_THROTTLE_BUDGET, help="--stable: seconds of continuous throttling (heat plus a frequency drop) tolerated before aborting (default %(default)s)")
     run.add_argument("--min-top-clock-residency", type=residency_threshold, help="--stable --needs gpu: exit 79 unless the GPU spent at least this fraction of the job's active time at its hardware-maximum clock, counted over the whole job (e.g. 0.99); off by default")
     run.add_argument("--min-freq-ratio", type=float, help="--stable: also abort with 76 once a busy unit stays below this fraction of its hardware maximum frequency for longer than --throttle-budget, whatever the heat (e.g. 0.85)")

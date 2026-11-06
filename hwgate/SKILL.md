@@ -32,7 +32,7 @@ hwgate run --needs cpu --cpus 4 --max-wait 300 -- python -m pytest -n 4 tests/
 
 ## Benchmarks: `--stable`
 
-`--stable` takes every slot, starts only after 120s at nominal heat and outside a Time Machine backup, and pins the fans at maximum. It exits 76 if it is throttled (heat plus a frequency drop) longer than `--throttle-budget` (default 10s), or if a backup starts. On success it prints a `--stable run:` frequency summary; quote it next to the numbers.
+`--stable` takes every slot, starts only after 120s at nominal heat, and pins the fans at maximum. It exits 76 if it is throttled (heat plus a frequency drop) longer than `--throttle-budget` (default 10s). On success it prints a `--stable run:` frequency summary; quote it next to the numbers.
 
 Give each case or A/B pair its own run, looping outside `hwgate`, so each starts cool and an abort costs one case. Inside a pair, alternate ABAB in one process.
 
@@ -75,7 +75,7 @@ It kills every job holding a slot this job needs (they exit 78) and starts at on
 |---|---|---|
 | the job's own | the job ran | read its output |
 | 75 | `--max-wait` ran out; nothing started | check `hwgate status`, retry later |
-| 76 | `--stable` aborted: throttling, `--min-freq-ratio`, or a backup | discard partial numbers; rerun, it waits for the cooldown |
+| 76 | `--stable` aborted: throttling or `--min-freq-ratio` | discard partial numbers; rerun, it waits for the cooldown |
 | 77 | battery below 35%, not charging | tell the user the Mac needs power |
 | 78 | killed by the user's `--user-override` | discard partial results; rerun once, it waits |
 | 79 | `--min-top-clock-residency` not met, or not measurable | the reason is logged; report the numbers as unqualified |
