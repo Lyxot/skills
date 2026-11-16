@@ -356,12 +356,14 @@ def test_a_thread_limit_the_caller_chose_is_left_alone(gate):
     assert result.stdout.strip() == "1"
 
 
-def test_heat_stops_a_new_job_sharing_with_one_admitted_while_cool(gate):
+def test_fair_heat_still_lets_jobs_share_a_slot(gate):
     gate.background("run", "--needs", "cpu", "--cpus", "1", "--", "sleep", "20")
-    result = gate("run", "--needs", "cpu", "--cpus", "1", "--max-wait", "0.2", "--", "true",
+    result = gate("run", "--needs", "cpu", "--cpus", "1", "--max-wait", "0.2", "--", "echo", "ran",
                   HWGATE_FORCE_THERMAL=1)
-    assert result.returncode == 75
-    assert "one heavy job at a time" in result.stderr
+    assert result.returncode == 0 and "ran" in result.stdout, result.stderr
+    # Nor does it widen a job to slots it never asked for.
+    other = gate("run", "--needs", "gpu", "--max-wait", "0.2", "--", "echo", "ran", HWGATE_FORCE_THERMAL=1)
+    assert other.returncode == 0 and "ran" in other.stdout, other.stderr
 
 
 def test_a_stable_job_takes_every_slot(gate):
@@ -660,22 +662,18 @@ def test_a_queue_entry_that_cannot_be_written_leaves_nothing_behind(monkeypatch,
     assert len(os.listdir("/dev/fd")) == before
 
 
-def test_status_shows_what_heat_makes_a_waiter_need_and_tags_only_barrier_holders(gate):
-    """At fair heat every job takes both slots; a --stable job held back by heat holds no barrier."""
+def test_status_shows_a_stable_waiter_held_back_by_heat_needs_every_slot_and_holds_no_barrier(gate):
     gate.background("run", "--needs", "cpu", "--cpus", "1", "--", "sleep", "30")
-    waiters = [subprocess.Popen([sys.executable, str(HWGATE), "run", "--needs", "gpu", *args, "--max-wait", "30",
-                                 "--", "true"], env=gate.environ(HWGATE_FORCE_THERMAL=1),
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-               for args in ([], ["--stable"])]
+    waiter = subprocess.Popen([sys.executable, str(HWGATE), "run", "--needs", "gpu", "--stable", "--max-wait", "30",
+                               "--", "true"], env=gate.environ(HWGATE_FORCE_THERMAL=1),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        lines = wait_for_status(gate, "queue: 2 waiting").splitlines()
-        plain, stable = (next(line for line in lines if line.startswith("  pid {}:".format(w.pid))) for w in waiters)
-        assert "needs gpu+cpu" in plain and "so new sharers hold back" in plain, lines
-        assert "needs gpu+cpu" in stable and "hold back" not in stable, lines
+        lines = wait_for_status(gate, "queue: 1 waiting").splitlines()
+        line = next(line for line in lines if line.startswith("  pid {}:".format(waiter.pid)))
+        assert "needs gpu+cpu" in line and "hold back" not in line, lines
     finally:
-        for proc in waiters:
-            proc.kill()
-            proc.wait()
+        waiter.kill()
+        waiter.wait()
 
 
 def test_a_job_leaves_the_queue_once_admitted(gate):

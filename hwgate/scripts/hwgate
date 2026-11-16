@@ -6,10 +6,9 @@ Every agent on this machine runs Metal/GPU work and heavy CPU work through
 over the GPU, cores, and heat.
 
 Slot policy, decided by the macOS thermal state when a job asks to start:
-  nominal   up to SLOT_PARALLEL jobs per slot, while their declared cores fit
-            the budget
-  fair      only one heavy job at all: a new job takes every slot
-  serious+  nothing new starts; after it clears, wait HWGATE_COOLDOWN seconds
+  nominal, fair  up to SLOT_PARALLEL jobs per slot, while their declared cores
+                 fit the budget (--stable still waits for nominal)
+  serious+       nothing new starts; after it clears, wait HWGATE_COOLDOWN seconds
 Running jobs are not stopped for heat: finishing costs less than restarting.
 
 Battery, on a Mac that has one: below BATTERY_MIN percent a new job is refused
@@ -29,7 +28,7 @@ the state dir.
 
 Jobs share a slot: up to SLOT_PARALLEL of them hold one at a time, because work
 that is not being timed loses little to running alongside other work. --stable is
-what asks for the machine alone, and heat does the same thing for every job. A
+what asks for the machine alone. A
 job waiting for a whole slot raises a barrier, so overlapping sharers cannot
 starve it. --priority N (default 0) orders waiters: a job does not start while
 one with a higher priority waits for a slot it needs, and drops any barrier it
@@ -1159,19 +1158,17 @@ def preempt(slots, instruction, handled):
         kill_group(lease["pgid"], signal.SIGKILL)
 
 
-def try_admit(requested, want, held, state, stable, barriers, override=False, priority=0):
+def try_admit(requested, want, held, stable, barriers, override=False, priority=0):
     """One attempt. Returns (slot fds, (lease fd, path), shared slots, refusal).
 
     Every refusal leaves through refuse(), so no path can keep a barrier it is no
     longer owed.
     """
-    # Heat and --stable collapse every slot to exclusive, which only works for a job
-    # that acquires; one that inherits its slots never gets here, so --stable refuses
-    # to run inside another job at all. An override takes what it needs whole, and
-    # heat does not widen that to slots whose holders it was never asked to kill.
-    alone = stable or (state >= FAIR and not override)
-    need = (set(SLOTS) if alone else set(requested)) - held
-    share = set() if alone or override else set(need)
+    # --stable collapses every slot to exclusive, which only works for a job that
+    # acquires; one that inherits its slots never gets here, so --stable refuses to
+    # run inside another job at all. An override takes what it needs whole.
+    need = (set(SLOTS) if stable else set(requested)) - held
+    share = set() if stable or override else set(need)
 
     def refuse(reason, blocking=frozenset(), fds=()):
         sync_barriers(barriers, set(blocking))
@@ -1219,8 +1216,6 @@ def try_admit(requested, want, held, state, stable, barriers, override=False, pr
                 reason = "{} slot busy{}".format(slot, holder_summary(slot, leases))
                 if stable:
                     reason += "; --stable runs alone"
-                elif alone:
-                    reason += "; thermal is fair, so one heavy job at a time"
                 sharers = {slot} if slot not in share and any(
                     slot in l["shared"] for l in leases) else set()
                 return refuse(reason, sharers, fds.values())
@@ -1313,7 +1308,7 @@ def acquire(requested, want, held, max_wait, stable, override=None, queued=None,
                 sync_barriers(barriers, set())
             else:
                 fds, lease_fd, share, reason = try_admit(
-                    requested, want, held, state, stable, barriers, override=bool(override), priority=priority)
+                    requested, want, held, stable, barriers, override=bool(override), priority=priority)
                 if reason is None:
                     return fds, lease_fd, share, state
             # Reasons carry running counters ("held ... for 668s"), which change every poll.
@@ -1323,8 +1318,7 @@ def acquire(requested, want, held, max_wait, stable, override=None, queued=None,
                 log("waiting: " + reason)
                 last_key, last_logged = key, now
                 record = dict(queued or {}, pid=os.getpid(), since=start, reason=reason,
-                              needs=sorted(set(SLOTS) if stable or (state >= FAIR and not override)
-                                           else set(requested)), stable=stable,
+                              needs=sorted(set(SLOTS) if stable else set(requested)), stable=stable,
                               override=bool(override), priority=priority,
                               ahead=bool(barriers))
                 try:
