@@ -37,7 +37,7 @@ TOKENIZER_FILES = (
     "chat_template.jinja", "chat_template.json", "preprocessor_config.json",
     "processor_config.json", "image_preprocessor_config.json",
     "video_preprocessor_config.json", "tokenizer.jsonl", "vocab.txt", "spiece.model",
-    "sentencepiece.bpe.model",
+    "sentencepiece.bpe.model", "tiktoken.model",
 )
 # Repos whose tokenizer or processor is remote code name it in an auto_map and ship the
 # module beside the config. Without it the tiny checkpoint cannot be opened at all, which
