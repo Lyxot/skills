@@ -12,7 +12,7 @@ Only these models, at these efforts. Pick by how hard the job is, not by habit.
 | Family | Super easy jobs | Daily use | Very hard jobs |
 |---|---|---|---|
 | Claude | `haiku-5.5` xhigh | `opus-5.5` medium / high | `fable-5.2` high |
-| Codex | `gpt-6-luna` xhigh | `gpt-6.1-sol` medium / high | `gpt-6-astra` high |
+| Codex | `gpt-6-luna` xhigh | `gpt-6.2-sol` medium / high | `gpt-6.2-astra` high |
 | Cursor | — | `auto` | — |
 | Antigravity | — | `gemini-4-hydrogen` high | `gemini-4-argon` / `gemini-4-carbon` high |
 
@@ -36,7 +36,7 @@ Set `model` and `effort` from the table before each call; the commands read them
 ### Codex
 
 ```bash
-# set first, from the table: model=gpt-6-luna|gpt-6.1-sol|gpt-6-astra effort=medium|high|xhigh
+# set first, from the table: model=gpt-6-luna|gpt-6.2-sol|gpt-6.2-astra effort=medium|high|xhigh
 codex -C "$root" exec --model "${model:?pick from the table}" -c "model_reasoning_effort=\"${effort:?pick from the table}\"" \
     --yolo --skip-git-repo-check --json --output-last-message "$out" "$prompt" </dev/null > "$log"
 session="$(jq -rn -R '[inputs | fromjson? | select(.type == "thread.started") | .thread_id] | first // empty' "$log")"
