@@ -13,7 +13,7 @@ Only these models, at these efforts. Pick by how hard the job is, not by habit.
 |---|---|---|---|
 | Claude | `haiku-5.5` xhigh | `opus-5.5` medium / high | `fable-5.2` high |
 | Codex | `gpt-6-luna` xhigh | `gpt-6.2-sol` medium / high | `gpt-6.2-astra` high |
-| Cursor | — | `auto` | — |
+| Cursor | — | `grok-4.7-high` | — |
 | Antigravity | — | `gemini-4-hydrogen` high | `gemini-4-argon` / `gemini-4-carbon` high |
 
 - Super easy: lookups, renames, summarising a log, mechanical edits. Very hard: subtle concurrency or numerics, design under real constraints, a bug others missed. Everything else is daily use; take high over medium when the job is long or a mistake is costly.
@@ -51,7 +51,7 @@ codex -C "$root" exec resume --model "${model:?pick from the table}" -c "model_r
 ### Cursor
 
 ```bash
-# set first: model=auto (Cursor's only allowed model; it takes no effort)
+# set first: model=grok-4.7-high (Cursor's only allowed model; its effort is part of the name)
 cursor-agent -p --output-format json --model "${model:?pick from the table}" --force --trust --workspace "$root" "$prompt" </dev/null > "$log"
 session="$(jq -r '.session_id // empty' "$log")"; jq -r '.result' "$log" > "$out"
 
@@ -60,7 +60,7 @@ cursor-agent -p --output-format json --model "${model:?pick from the table}" --f
 jq -r '.result' "$log2" > "$out2"
 ```
 
-- Result `.result`, session `.session_id`, in one JSON object. Without `--force` shell commands are blocked, so the agent cannot run `git diff` or tests. Never `--continue`.
+- Result `.result`, session `.session_id`, in one JSON object; check `.is_error` first. Without `--force` shell commands are blocked, so the agent cannot run `git diff` or tests. Never `--continue`.
 
 ### Claude
 
