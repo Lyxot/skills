@@ -32,7 +32,7 @@ hwgate run --needs cpu --cpus 4 --max-wait 300 -- python -m pytest -n 4 tests/
 
 ## Benchmarks: `--stable`
 
-`--stable` takes every slot, starts only after 120s at nominal heat, and pins the fans at maximum. It exits 76 if it is throttled (heat plus a frequency drop) longer than `--throttle-budget` (default 10s). On success it prints a `--stable run:` frequency summary; quote it next to the numbers.
+`--stable` takes every slot, starts only after 120s at nominal heat, and pins the fans: at maximum, or at a lower set level (see the fan setup below) that goes to maximum for the rest of the job once the heat leaves nominal. It exits 76 if it is throttled (heat plus a frequency drop) longer than `--throttle-budget` (default 10s). On success it prints a `--stable run:` frequency summary; quote it next to the numbers.
 
 Give each case or A/B pair its own run, looping outside `hwgate`, so each starts cool and an abort costs one case. Inside a pair, alternate ABAB in one process.
 
@@ -51,7 +51,7 @@ Optional, outermost call only, never for correctness tests:
 - `--min-freq-ratio 0.85`: exit 76 once a busy unit stays below that share of its hardware maximum frequency for longer than the budget. Only for work that saturates the unit.
 - `--min-top-clock-residency R` (with `--needs gpu`): exit 79 unless the GPU spent at least `R` of the job's active time at its hardware-maximum clock. It counts the whole job, loading and warmup included, and all GPU work on the machine. A run is also left unqualified (79) when the GPU was active under 5s or used a state with no known frequency. Its log line also shows the share of the run the GPU's thermal-manager counters (`GPU_CLTM`) spent outside `NO_CLTM`, as evidence only. Even a saturated GPU can sit well below 0.99, so choose `R` from measured runs; a high `GPU_CLTM` share suggests heat, where a cooler rerun may pass.
 
-The fans need a one-time setup by the user (agents can't sudo): `sudo sh <skill dir>/scripts/install-fan-helper.sh`, then the `NOPASSWD` line it prints. Until then `--stable` runs with automatic fans and says so.
+The fans need a one-time setup by the user (agents can't sudo): `sudo sh <skill dir>/scripts/install-fan-helper.sh`, then the `NOPASSWD` line it prints. Until then `--stable` runs with automatic fans and says so. `--percent N` (75 to 100) on that install pins them at N% of each fan's maximum rpm, not of the min–max range; it is stored root-owned in `/usr/local/libexec/hwgate-fan.conf` (`percent=N`), kept across reinstalls without the flag, and changed only by the user with sudo. The heat boost needs the `full` entry in the sudoers line the installer prints; without it the run logs once that the fans could not be raised to maximum, and they stay at the set level. `hwgate status` shows the live level while the fans are pinned.
 
 ## Priority
 

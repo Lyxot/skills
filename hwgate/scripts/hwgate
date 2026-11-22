@@ -69,7 +69,9 @@ Stable-performance jobs (--stable: benchmarks, timing or throughput runs):
     rather than passed. The counters are machine-wide, and the window includes
     loading and warmup. A job that fails keeps its own exit status. The
     report adds GPU_CLTM residency (the thermal manager) as evidence only;
-  - run with every fan pinned at its maximum, handed back to macOS when the
+  - run with every fan pinned (at its maximum unless the helper's
+    hwgate-fan.conf sets a lower share, raised to maximum for the rest of
+    the job once the heat leaves nominal), handed back to macOS when the
     job exits, through `sudo -n` on a root helper that
     scripts/install-fan-helper.sh installs and a NOPASSWD rule allows;
     hwgate itself never runs as root;
@@ -154,7 +156,7 @@ COOLDOWN = float(os.environ.get("HWGATE_COOLDOWN", "60"))
 STABLE_COOLDOWN = float(os.environ.get("HWGATE_STABLE_COOLDOWN", "120"))
 # A --stable run longer than this is reminded at exit to give each case its own run.
 STABLE_SPLIT_HINT = float(os.environ.get("HWGATE_STABLE_SPLIT_HINT", "600"))
-# Pins the fans at maximum for a --stable run once install-fan-helper.sh has run; empty disables.
+# Pins the fans for a --stable run once install-fan-helper.sh has run; empty disables.
 FAN_CMD = os.environ.get("HWGATE_FAN_CMD", "sudo -n /usr/local/libexec/hwgate-fan").split()
 DEFAULT_THROTTLE_BUDGET = 10.0
 # Battery percent below which a job is refused, and the level a charging battery must regain.
@@ -763,7 +765,26 @@ def run_fans(mode):
     return result.stdout
 
 
+def pinned_percent(report):
+    """The percent of maximum a helper's max output says it pinned at; an older helper prints none."""
+    m = re.search(r"^pin: (\d+)% of max$", report, re.M)
+    return int(m.group(1)) if m else 100
+
+
+def live_percent(report):
+    """The lowest percent of maximum a status report's manual fans target."""
+    shares = [float(t) / float(m) for m, t in re.findall(
+        r"^fan \d+: .*max (\d+), target (\d+)\), manual$", report, re.M) if float(m) > 0 and float(t) > 0]
+    return round(100 * min(shares)) if shares else 100
+
+
+def fan_level(percent):
+    return "at {}% of maximum".format(percent) if percent < 100 else "at maximum"
+
+
 _fans_owed = False
+_fans_below_max = False
+_boost = None
 
 
 def _exit_on_signal(signum, _frame):
@@ -772,11 +793,11 @@ def _exit_on_signal(signum, _frame):
 
 def pin_fans():
     """Pin the fans for a --stable run; release_fans() hands them back."""
-    global _fans_owed
+    global _fans_owed, _fans_below_max
     if not FAN_CMD:
         return
     if not fan_helper_installed():
-        log("--stable: fans left on automatic; scripts/install-fan-helper.sh would pin them at maximum")
+        log("--stable: fans left on automatic; scripts/install-fan-helper.sh would pin them")
         return
     # Owed before the helper runs: a failed or interrupted pin may still have taken some fans.
     _fans_owed = True
@@ -785,10 +806,31 @@ def pin_fans():
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _exit_on_signal)
     try:
-        run_fans("max")
-        log("--stable: fans pinned at maximum until the job exits")
+        percent = pinned_percent(run_fans("max"))
+        _fans_below_max = percent < 100
+        log("--stable: fans pinned {} until the job exits{}".format(
+            fan_level(percent), ", or raised to maximum once the heat leaves nominal" if _fans_below_max else ""))
     except OSError as e:
-        log("--stable: could not pin the fans at maximum: {}".format(e))
+        log("--stable: could not pin the fans: {}".format(e))
+
+
+def boost_fans():
+    """Once per run, in the background: the throttle watch must not wait on the helper."""
+    global _boost
+    if not _fans_below_max or _boost:
+        return
+
+    def full():
+        try:
+            run_fans("full")
+            log("--stable: heat left nominal; fans raised to maximum until the job exits")
+        except OSError as e:
+            log("--stable: heat left nominal, but the fans could not be raised to maximum ({}); rerun "
+                "scripts/install-fan-helper.sh and add the sudoers line it prints".format(e))
+
+    thread = threading.Thread(target=full, daemon=True)
+    thread.start()
+    _boost = thread
 
 
 def release_fans():
@@ -796,6 +838,9 @@ def release_fans():
     if not _fans_owed:
         return
     _fans_owed = False
+    # A boost still running would otherwise take the fans again after auto.
+    if _boost:
+        _boost.join()
     try:
         run_fans("auto")
     except OSError as e:
@@ -1595,6 +1640,8 @@ def cmd_run(args):
                     break
                 # Read every run, so heat caused by any job delays the next --stable one.
                 now_state = read_thermal()[0]
+                if watch and now_state > NOMINAL:
+                    boost_fans()
                 reason = watch.check(now_state) if watch else None
                 if not reason:
                     continue
@@ -1747,16 +1794,17 @@ def cmd_status(args):
         print("budget: {}/{} cores declared".format(sum(lease["cpus"] for lease in leases), cpu_budget()))
     if fan_helper_installed():
         try:
-            pinned = re.search(r"^fan \d+: .*, manual$", run_fans("status"), re.M) is not None
+            report = run_fans("status")
+            pinned = re.search(r"^fan \d+: .*, manual$", report, re.M) is not None
         except OSError as e:
             print(paint("fans: unknown ({})".format(e), "yellow"))
         else:
             if pinned and (not leases_known or any(lease.get("stable") for lease in leases)):
-                print("fans: pinned at maximum")
+                print("fans: pinned {}".format(fan_level(live_percent(report))))
             elif pinned:
                 # Only a wrapper killed outright skips handing them back.
-                print(paint("fans: pinned at maximum with no --stable run; restore with: {} auto".format(
-                    " ".join(FAN_CMD)), "red"))
+                print(paint("fans: pinned {} with no --stable run; restore with: {} auto".format(
+                    fan_level(live_percent(report)), " ".join(FAN_CMD)), "red"))
 
     print()
     # Each job once, however many slots it holds; keyed by pid, so a holder known only from an

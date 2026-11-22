@@ -1273,9 +1273,14 @@ if mode in {fail!r}:
     sys.exit("no SMC")
 if mode in {block!r}:
     time.sleep({block_seconds})
+if mode == "full":
+    with open({calls!r}, "a") as f:
+        f.write("full-done\\n")
 if mode == "status":
     print("fans 2, Ftst unlock off")
     print({status!r})
+if mode == "max" and {level!r}:
+    print("pin: {level}% of max")
 """
 
 
@@ -1291,12 +1296,12 @@ def test_a_long_stable_run_is_told_to_give_each_case_its_own_run(gate, flags, se
     assert ("its own --stable run" in result.stderr) is hinted, result.stderr
 
 
-def fake_fan_helper(tmp_path, fail=(), block=(), status="", block_seconds=30):
+def fake_fan_helper(tmp_path, fail=(), block=(), status="", block_seconds=30, level=None):
     """A helper recording the modes it is run with; it fails those in `fail` and hangs in those in `block`."""
     calls = tmp_path / "fan_calls"
     helper = tmp_path / "hwgate-fan"
     helper.write_text(FAN_HELPER.format(python=sys.executable, calls=str(calls), fail=list(fail),
-                                        block=list(block), status=status, block_seconds=block_seconds))
+                                        block=list(block), status=status, block_seconds=block_seconds, level=level))
     helper.chmod(0o755)
     return helper, calls
 
@@ -1329,7 +1334,7 @@ def test_a_failed_pin_still_runs_the_job_and_hands_back_what_it_took(gate, tmp_p
     helper, calls = fake_fan_helper(tmp_path, fail=["max"])
     result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "echo", "ran", HWGATE_FAN_CMD=helper)
     assert result.returncode == 0 and "ran" in result.stdout
-    assert "could not pin the fans at maximum: no SMC" in result.stderr
+    assert "could not pin the fans: no SMC" in result.stderr
     assert fan_calls(calls) == ["max", "auto"]
 
 
@@ -1357,9 +1362,15 @@ def test_without_the_helper_a_stable_run_says_how_to_install_it(gate, tmp_path):
     assert "install-fan-helper.sh" in result.stderr
 
 
+def pinned_report(*targets):
+    """Status lines for manual fans of max 5000 rpm at these targets."""
+    return "\n".join("fan {}: 4500 rpm (min 1000, max 5000, target {}), manual".format(i, t) for i, t in enumerate(targets))
+
+
 @pytest.mark.parametrize("report, shown", [
     ("fan 0: 5000 rpm, manual", "pinned at maximum with no --stable run; restore with: "),
-    ("fan 0: 2000 rpm, auto", None),
+    (pinned_report(5000, 4500), "pinned at 90% of maximum with no --stable run; restore with: "),
+    ("fan 0: 2000 rpm (min 1000, max 5000, target 2000), auto", None),
 ])
 def test_status_tells_how_to_release_fans_no_stable_run_holds(gate, tmp_path, report, shown):
     helper, _ = fake_fan_helper(tmp_path, status=report)
@@ -1370,12 +1381,78 @@ def test_status_tells_how_to_release_fans_no_stable_run_holds(gate, tmp_path, re
         assert "fans:" not in status, status
 
 
-def test_status_does_not_call_a_stable_runs_fans_left_behind(gate, tmp_path):
-    helper, _ = fake_fan_helper(tmp_path, status="fan 0: 5000 rpm, manual")
+@pytest.mark.parametrize("report, shown", [
+    ("fan 0: 5000 rpm, manual", "at maximum"),
+    (pinned_report(5000), "at maximum"),
+    (pinned_report(5000, 4000), "at 80% of maximum"),
+    (pinned_report(4500, 0), "at 90% of maximum"),
+])
+def test_status_shows_a_stable_runs_live_fan_level_without_calling_it_left_behind(gate, tmp_path, report, shown):
+    helper, _ = fake_fan_helper(tmp_path, status=report)
     gate.background("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sleep", "30",
                     HWGATE_FAN_CMD=helper)
     status = gate("status", HWGATE_FAN_CMD=helper).stdout
-    assert "fans: pinned at maximum\n" in status, status
+    assert "fans: pinned {}\n".format(shown) in status, status
+
+
+@pytest.mark.parametrize("level, shown", [(None, "at maximum"), (100, "at maximum"), (85, "at 85% of maximum")])
+def test_a_stable_run_logs_the_level_the_helper_pinned_at(gate, tmp_path, level, shown):
+    helper, _ = fake_fan_helper(tmp_path, level=level)
+    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "true", HWGATE_FAN_CMD=helper)
+    assert "fans pinned {} until the job exits".format(shown) in result.stderr, result.stderr
+
+
+def heats_up(tmp_path, seconds="3", heat=True):
+    """A job that moves the forced thermal state to fair (or leaves it nominal), then keeps running."""
+    thermal = tmp_path / "thermal"
+    thermal.write_text("0")
+    return thermal, ["sh", "-c", "echo {} > {}; sleep {}".format(int(heat), thermal, seconds)]
+
+
+@pytest.mark.parametrize("level, heat, expected", [
+    (90, True, ["max", "full", "full-done", "auto"]),
+    (90, False, ["max", "auto"]),
+    (None, True, ["max", "auto"]),
+    (100, True, ["max", "auto"]),
+], ids=["below-max-heats", "below-max-cool", "old-helper-heats", "at-max-heats"])
+def test_heat_raises_fans_pinned_below_maximum_once(gate, tmp_path, level, heat, expected):
+    helper, calls = fake_fan_helper(tmp_path, level=level)
+    thermal, job = heats_up(tmp_path, heat=heat)
+    result = gate("run", "--needs", "gpu", "--stable", "--throttle-budget", "30", "--max-wait", "3", "--", *job,
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal)
+    assert result.returncode == 0, result.stderr
+    assert fan_calls(calls) == expected, result.stderr
+    assert ("fans raised to maximum" in result.stderr) == ("full" in expected), result.stderr
+
+
+def test_fans_are_handed_back_only_after_a_boost_finishes(gate, tmp_path):
+    helper, calls = fake_fan_helper(tmp_path, level=90, block=["full"], block_seconds=3)
+    thermal, job = heats_up(tmp_path, seconds="1.5")
+    result = gate("run", "--needs", "gpu", "--stable", "--throttle-budget", "30", "--max-wait", "3", "--", *job,
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal)
+    assert result.returncode == 0, result.stderr
+    assert fan_calls(calls) == ["max", "full", "full-done", "auto"], result.stderr
+
+
+def test_a_slow_boost_does_not_hold_up_the_watch(gate, tmp_path):
+    """The timeout kill lands while the boost is still running; only handing the fans back waits for it."""
+    helper, calls = fake_fan_helper(tmp_path, level=90, block=["full"], block_seconds=10)
+    thermal, _ = heats_up(tmp_path)
+    job = ["sh", "-c", "trap 'echo killed >> {0}; exit 1' TERM; echo 1 > {1}; sleep 30 & wait".format(calls, thermal)]
+    result = gate("run", "--needs", "gpu", "--stable", "--throttle-budget", "30", "--timeout", "4", "--max-wait", "3",
+                  "--", *job, HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal)
+    assert "timeout after 4.0s" in result.stderr, result.stderr
+    assert fan_calls(calls) == ["max", "full", "killed", "full-done", "auto"], result.stderr
+
+
+def test_a_refused_boost_is_reported_once_and_the_run_goes_on(gate, tmp_path):
+    helper, calls = fake_fan_helper(tmp_path, level=90, fail=["full"])
+    thermal, job = heats_up(tmp_path)
+    result = gate("run", "--needs", "gpu", "--stable", "--throttle-budget", "30", "--max-wait", "3", "--", *job,
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal)
+    assert result.returncode == 0, result.stderr
+    assert result.stderr.count("fans could not be raised to maximum (no SMC)") == 1, result.stderr
+    assert fan_calls(calls) == ["max", "full", "auto"], result.stderr
 
 
 def test_a_nested_job_is_charged_what_it_declares_beyond_its_parent(gate):
