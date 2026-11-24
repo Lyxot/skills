@@ -14,10 +14,10 @@ Only these models, at these efforts. Pick by how hard the job is, not by habit.
 | Claude | `haiku-5.5` xhigh | `opus-5.5` medium / high | `fable-5.2` high |
 | Codex | `gpt-6-luna` xhigh | `gpt-6.2-sol` medium / high | `gpt-6.2-astra` high |
 | Cursor | — | `grok-4.7-high` | — |
-| Antigravity | `gemini-4-hydrogen` high | `gemini-4-neon` medium / high | `gemini-4-argon` / `gemini-4-carbon` high |
+| Antigravity | `gemini-4-hydrogen` high | `gemini-4-neon` medium / high | `gemini-4-carbon` high, else `gemini-4-argon` high |
 
 - Super easy: lookups, renames, summarising a log, mechanical edits. Very hard: subtle concurrency or numerics, design under real constraints, a bug others missed. Everything else is daily use; take high over medium when the job is long or a mistake is costly.
-- agy also lists Claude, GPT-OSS, Flash and Orchestrator models; never use those through agy. `gemini-4-carbon` appears only on some accounts: use it when `agy models` lists it, otherwise `gemini-4-argon`.
+- agy also lists Claude, GPT-OSS, Flash and Orchestrator models; never use those through agy. For very hard jobs use `gemini-4-carbon`, the strongest; fall back to `gemini-4-argon` only when carbon is not listed in `agy models` or its run fails.
 - A task's own instructions (a review workflow, say) may narrow this list; they never widen it.
 
 ## Built-in tools first
