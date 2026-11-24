@@ -55,7 +55,7 @@ The fans need a one-time setup by the user (agents can't sudo): `sudo sh <skill 
 
 ## Priority
 
-`--priority N` (default 0) lets a job go first: while it waits for a slot, jobs with a lower priority that need that slot do not start, and none raises a barrier against it. Equal priorities keep the usual order, and running jobs are never stopped. Set it only when the user asks for a job to go first; everyone else leaves it at 0, or priorities stop meaning anything.
+`--priority N` (default 0) lets a job go first: while it waits for a slot, jobs with a lower priority that need that slot do not start, and none raises a barrier against it. At equal priority, a waiting job without `--stable` goes before a `--stable` one, which would hold the whole machine for its run. Otherwise equal priorities keep the usual order, and running jobs are never stopped. Set it only when the user asks for a job to go first; everyone else leaves it at 0, or priorities stop meaning anything.
 
 ## User override
 
@@ -69,7 +69,7 @@ It kills every job holding a slot this job needs (they exit 78) and starts at on
 
 ## Status and exit codes
 
-`hwgate status` shows heat, battery, budget, each slot and its jobs, the jobs waiting to start (by priority, then arrival; new sharers hold back for a job waiting for a whole slot, which is marked), and each running job with its pid and command (`--full` for whole commands). `hwgate:` lines on stderr say why a job waits.
+`hwgate status` shows heat, battery, budget, each slot and its jobs, the jobs waiting to start (by priority, then jobs without `--stable`, then arrival; new sharers hold back for a job waiting for a whole slot, which is marked), and each running job with its pid and command (`--full` for whole commands). `hwgate:` lines on stderr say why a job waits.
 
 | Code | Meaning | What to do |
 |---|---|---|

@@ -606,7 +606,7 @@ def test_status_lists_waiting_jobs_by_arrival_and_tags_whole_slot_takers(gate):
     older = wait_in_line("--max-wait", "30", "--", "echo", "older")
     wait_for_status(gate, "queue: 1 waiting")
     whole = wait_in_line("--stable", "--max-wait", "30", "--", "echo", "whole")
-    status = wait_for_status(gate, "queue: 2 waiting, by priority, then arrival; within a priority there is no fixed order")
+    status = wait_for_status(gate, "is waiting without --stable and goes first")
     try:
         lines = status.splitlines()
         first = next(i for i, line in enumerate(lines) if line.startswith("  pid {}:".format(older.pid)))
@@ -615,7 +615,10 @@ def test_status_lists_waiting_jobs_by_arrival_and_tags_whole_slot_takers(gate):
         assert "needs gpu, waiting" in lines[first] and "whole slot" not in lines[first], status
         assert "slot is full" in lines[first + 1] and lines[first + 2].strip() == "echo older", status
         assert "--stable, needs gpu+cpu" in lines[second], status
-        assert "waiting for a whole slot, so new sharers hold back" in lines[second], status
+        assert "by priority, then jobs without --stable, then arrival; within that there is no fixed order" in status
+        # It gives way to the older waiter, so it holds no barrier against it.
+        assert "whole slot" not in lines[second], status
+        assert "pid {} is waiting without --stable and goes first".format(older.pid) in lines[second + 1], status
     finally:
         for proc in (older, whole):
             proc.kill()
@@ -1840,6 +1843,53 @@ def test_a_lower_priority_barrier_gives_way_to_a_higher_priority_sharer(gate):
         low.wait()
 
 
+@pytest.mark.parametrize("priority, deferred", [("0", True), ("1", False)])
+def test_a_stable_job_gives_way_to_a_waiter_without_stable_of_its_priority(gate, priority, deferred):
+    for _ in range(3):
+        gate.background("run", "--needs", "gpu", "--", "sleep", "20")
+    waiter = queued_waiter(gate, "--needs", "gpu", "--max-wait", "25", "--", "true")
+    try:
+        stable = gate("run", "--needs", "gpu", "--stable", "--priority", priority, "--max-wait", "1", "--", "true",
+                      HWGATE_COOLDOWN=0)
+        assert stable.returncode == 75, stable.stderr
+        said = "pid {} is waiting without --stable and goes first".format(waiter.pid)
+        assert (said in stable.stderr) is deferred, stable.stderr
+    finally:
+        waiter.kill()
+        waiter.wait()
+
+
+def test_a_stable_waiters_barrier_gives_way_to_a_sharer_of_its_priority(gate):
+    gate.background("run", "--needs", "cpu", "--cpus", "1", "--", "sleep", "20")
+    stable = subprocess.Popen([sys.executable, str(HWGATE), "run", "--needs", "cpu", "--stable", "--max-wait", "25",
+                               "--", "true"], env=gate.environ(HWGATE_COOLDOWN=0),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_for_barrier(gate, "cpu")
+        sharer = gate("run", "--needs", "cpu", "--cpus", "1", "--max-wait", "15", "--", "echo", "ran")
+        assert sharer.returncode == 0 and "ran" in sharer.stdout, sharer.stderr
+    finally:
+        stable.kill()
+        stable.wait()
+
+
+@pytest.mark.parametrize("priority, stable_first", [("0", False), ("1", True)])
+def test_status_lists_waiters_without_stable_first_within_a_priority(gate, priority, stable_first):
+    for _ in range(3):
+        gate.background("run", "--needs", "gpu", "--", "sleep", "20")
+    stable = queued_waiter(gate, "--needs", "gpu", "--stable", "--priority", priority, "--max-wait", "25", "--",
+                           "true", HWGATE_COOLDOWN=0)
+    plain = queued_waiter(gate, "--needs", "gpu", "--max-wait", "25", "--", "true")
+    try:
+        status = wait_for_status(gate, "queue: 2 waiting")
+        stable_at, plain_at = status.index("pid {}:".format(stable.pid)), status.index("pid {}:".format(plain.pid))
+        assert (stable_at < plain_at) is stable_first, status
+    finally:
+        for proc in (stable, plain):
+            proc.kill()
+            proc.wait()
+
+
 def test_status_lists_waiters_by_priority(gate):
     gate.background("run", "--needs", "gpu", "--stable", "--", "sleep", "20", HWGATE_COOLDOWN=0)
     first = queued_waiter(gate, "--needs", "gpu", "--max-wait", "25", "--", "true")
@@ -1848,7 +1898,7 @@ def test_status_lists_waiters_by_priority(gate):
         status = wait_for_status(gate, "queue: 2 waiting")
         assert status.index("pid {}:".format(second.pid)) < status.index("pid {}:".format(first.pid)), status
         line = next(line for line in status.splitlines() if "pid {}:".format(second.pid) in line)
-        assert "priority 2" in line and "by priority, then arrival" in status, status
+        assert "priority 2" in line and "by priority, then jobs without --stable, then arrival" in status, status
     finally:
         for proc in (first, second):
             proc.kill()

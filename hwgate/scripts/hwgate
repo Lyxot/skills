@@ -32,7 +32,8 @@ what asks for the machine alone. A
 job waiting for a whole slot raises a barrier, so overlapping sharers cannot
 starve it. --priority N (default 0) orders waiters: a job does not start while
 one with a higher priority waits for a slot it needs, and drops any barrier it
-holds; equal priorities keep the order above. A job admitted onto a slot that others already hold is told which
+holds; at equal priority a --stable job likewise gives way to a waiting job
+without --stable; otherwise equal priorities keep the order above. A job admitted onto a slot that others already hold is told which
 ones, because sharing is the one admission outcome that changes how the job runs
 without making it wait, and nothing else in its output would reveal it.
 
@@ -1232,9 +1233,14 @@ def try_admit(requested, want, held, stable, barriers, override=False, priority=
         if not override and not nested:
             for waiter in read_queue():
                 # Checked before any barrier is raised, so a refusal here drops this job's barriers.
-                if waiter.get("priority", 0) > priority and set(waiter.get("needs", ())) & need:
+                if not set(waiter.get("needs", ())) & need:
+                    continue
+                if waiter.get("priority", 0) > priority:
                     return refuse("pid {} has priority {} and goes first".format(
                         waiter.get("pid"), waiter.get("priority")))
+                # A --stable job would hold every slot alone for its whole run; quick shared work goes first.
+                if stable and not waiter.get("stable") and waiter.get("priority", 0) == priority:
+                    return refuse("pid {} is waiting without --stable and goes first".format(waiter.get("pid")))
         used_cpus = sum(lease["cpus"] for lease in leases)
         # A job taking the cpu slot whole is answered by the lock below, never the budget:
         # only a lock refusal raises its barrier, and without one sharers declaring cores
@@ -1838,12 +1844,13 @@ def cmd_status(args):
             jobs.setdefault(lease.get("child_pid") or lease["path"], lease)
 
     now = time.time()
-    waiters = sorted(read_queue(), key=lambda w: -w.get("priority", 0))
+    waiters = sorted(read_queue(), key=lambda w: (-w.get("priority", 0), bool(w.get("stable"))))
     if waiters:
         print()
         # Waiters retry every second or two and whichever asks first once a slot frees gets it,
-        # so arrival is all that can be shown; only a priority or a barrier changes who goes first.
-        print("queue: {} waiting{}".format(len(waiters), ", by priority, then arrival; within a priority there is no"
+        # so arrival is all that can be shown; only a priority, --stable or a barrier changes who goes first.
+        print("queue: {} waiting{}".format(len(waiters), ", by priority, then jobs without --stable, then arrival;"
+                                           " within that there is no"
                                            " fixed order: whoever asks first once a slot frees gets it, except that"
                                            " new sharers hold back for a job waiting for a whole slot"
                                            if len(waiters) > 1 else ""))
