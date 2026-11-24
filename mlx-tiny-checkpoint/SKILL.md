@@ -135,3 +135,10 @@ family rather than about the tiny checkpoint:
 
 Keep the checkpoints out of the workspace tree. `/tmp` or a
 `tempfile.TemporaryDirectory` is right; they are disposable.
+
+**Delete each checkpoint once its question is answered.** One is hundreds of
+megabytes and comes back in seconds from `shrink.json` and the cached metadata,
+so keep the `shrink.json` (and the command) where the finding is recorded, not
+the weights. Never write checkpoints under `~/.cache/mlx-tiny-checkpoint/`:
+that directory is the metadata cache, which stays, and a checkpoint left there
+is never cleaned up.
