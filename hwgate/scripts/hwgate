@@ -26,6 +26,10 @@ to itself, past every heat, battery and queue check; a --stable one is still
 watched for throttling once it runs. Each use is appended to overrides.log in
 the state dir.
 
+`hwgate pause-stable [--reason TEXT]` keeps new --stable jobs waiting, as if the
+machine were hot, until `hwgate resume-stable`; running jobs, jobs without
+--stable and --user-override are unaffected, and status shows the pause.
+
 Jobs share a slot: up to SLOT_PARALLEL of them hold one at a time, because work
 that is not being timed loses little to running alongside other work. --stable is
 what asks for the machine alone. A
@@ -373,6 +377,29 @@ def battery():
         return level, "power" if props.get("ExternalConnected") and amperage > -BATTERY_DRAIN_MA else "battery"
     except Exception:
         return None
+
+
+def stable_pause():
+    """The pause-stable record ({"since", "reason"}), or None while --stable jobs may start."""
+    try:
+        with open(os.path.join(STATE_DIR, "stable-paused")) as f:
+            pause = json.load(f)
+        since = pause.get("since") if isinstance(pause, dict) else None
+        if isinstance(since, (int, float)) and not isinstance(since, bool) and 0 <= since <= time.time() + 86400:
+            return pause
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, RecursionError):
+        pass
+    # A pause that cannot be read still pauses: starting a benchmark is the riskier mistake.
+    return {"since": None, "reason": "unreadable pause file"}
+
+
+def pause_text(pause):
+    reason = " ({})".format(pause["reason"]) if pause.get("reason") else ""
+    since = pause.get("since")
+    held = " for {:.0f}m".format(max(0, time.time() - since) / 60) if since is not None else ""
+    return "new --stable jobs are paused{}{}; hwgate resume-stable lets them start".format(reason, held)
 
 
 def battery_hold(reading, record=True):
@@ -1230,10 +1257,16 @@ def try_admit(requested, want, held, stable, barriers, override=False, priority=
         # it may be waiting on this job's own parent. The cost is that a parent starting
         # sharers back to back can keep a waiter out for as long as it runs.
         nested = bool(held) or inside_gated_job(leases)
+        # Under the lock, so no --stable job starts once pause-stable has returned.
+        pause = stable_pause()
+        if pause and stable and not override:
+            return refuse(pause_text(pause))
         if not override and not nested:
             for waiter in read_queue():
                 # Checked before any barrier is raised, so a refusal here drops this job's barriers.
-                if not set(waiter.get("needs", ())) & need:
+                # A paused --stable waiter cannot start, so it holds no one back.
+                if not set(waiter.get("needs", ())) & need or (
+                        pause and waiter.get("stable") and not waiter.get("override")):
                     continue
                 if waiter.get("priority", 0) > priority:
                     return refuse("pid {} has priority {} and goes first".format(
@@ -1770,13 +1803,16 @@ def cmd_status(args):
     columns = shutil.get_terminal_size((100, 24)).columns if sys.stdout.isatty() else 160
     width = None if args.full else max(40, columns - 4)
     state, cooldown, warm_cooldown = read_thermal()
+    pause = stable_pause()
     heat = THERMAL_NAMES.get(state, state)
     line = "thermal: " + paint(heat, "green" if state == NOMINAL else "yellow" if state == FAIR else "red")
     if cooldown > 0 and state < SERIOUS:
         line += " (cooling down, {:.0f}s left)".format(cooldown)
-    elif warm_cooldown > 0 and state == NOMINAL:
+    elif warm_cooldown > 0 and state == NOMINAL and not pause:
         line += " (--stable admits in {:.0f}s)".format(warm_cooldown)
     print(line)
+    if pause:
+        print(paint(pause_text(pause), "yellow"))
     reading = battery()
     if reading:
         hold, refused = battery_hold(reading, record=False)
@@ -1891,6 +1927,31 @@ def cmd_status(args):
     return 0
 
 
+def cmd_pause_stable(args):
+    path = os.path.join(STATE_DIR, "stable-paused")
+    tmp = "{}.{}".format(path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump({"since": time.time(), "reason": args.reason}, f)
+    # Published under the admission lock: a --stable job admitted after this returns has seen it.
+    with admit_lock() as locked:
+        os.replace(tmp, path)
+    if not locked:
+        log("paused without the admission lock; a --stable job being admitted right now may still start")
+        return 1
+    print("new --stable jobs will wait until: hwgate resume-stable")
+    return 0
+
+
+def cmd_resume_stable(args):
+    try:
+        os.remove(os.path.join(STATE_DIR, "stable-paused"))
+    except FileNotFoundError:
+        print("--stable jobs were not paused")
+        return 0
+    print("--stable jobs may start again")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(prog="hwgate", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="action", required=True)
@@ -1908,10 +1969,14 @@ def main():
     run.add_argument("command", nargs=argparse.REMAINDER)
     status = sub.add_parser("status", help="show thermal state and who holds each slot")
     status.add_argument("--full", action="store_true", help="print each job's whole command instead of one line of it")
+    pause = sub.add_parser("pause-stable", help="keep new --stable jobs waiting until resume-stable; running jobs go on")
+    pause.add_argument("--reason", default="", help="shown to waiting jobs and in status")
+    sub.add_parser("resume-stable", help="let --stable jobs start again")
     args = parser.parse_args()
     for directory in ("leases", "queue"):
         os.makedirs(os.path.join(STATE_DIR, directory), exist_ok=True)
-    return cmd_run(args) if args.action == "run" else cmd_status(args)
+    return {"run": cmd_run, "status": cmd_status, "pause-stable": cmd_pause_stable,
+            "resume-stable": cmd_resume_stable}[args.action](args)
 
 
 if __name__ == "__main__":

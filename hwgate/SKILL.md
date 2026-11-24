@@ -57,6 +57,10 @@ The fans need a one-time setup by the user (agents can't sudo): `sudo sh <skill 
 
 `--priority N` (default 0) lets a job go first: while it waits for a slot, jobs with a lower priority that need that slot do not start, and none raises a barrier against it. At equal priority, a waiting job without `--stable` goes before a `--stable` one, which would hold the whole machine for its run. Otherwise equal priorities keep the usual order, and running jobs are never stopped. Set it only when the user asks for a job to go first; everyone else leaves it at 0, or priorities stop meaning anything.
 
+## Pausing `--stable`
+
+`hwgate pause-stable [--reason TEXT]` keeps new `--stable` jobs waiting (they wait as for heat, and exit 75 at `--max-wait`) until `hwgate resume-stable`. Running jobs, jobs without `--stable` and `--user-override` are unaffected; `hwgate status` shows the pause. Both are the user's commands: run them only when the user asks.
+
 ## User override
 
 Only when the user explicitly tells you to take the machine for a job, add `--user-override` with their instruction word for word:
@@ -87,6 +91,7 @@ It kills every job holding a slot this job needs (they exit 78) and starts at on
 - Never run gated work outside `hwgate` because a slot is busy. Wait or retry.
 - Never pass `--user-override` without the user's explicit, verbatim instruction for that takeover.
 - Never raise `--priority` unless the user asked for that job to go first.
+- Never run `pause-stable` or `resume-stable` unless the user asked.
 - Never under-declare `--cpus`.
 - Never set `HWGATE_FORCE_*`, `HWGATE_STATE_DIR` or `HWGATE_TOP_CLOCK_MIN_ACTIVE` outside hwgate's own tests.
 - Don't wrap commands that leave a background process behind: it is killed when the job returns.

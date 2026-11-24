@@ -1903,3 +1903,62 @@ def test_status_lists_waiters_by_priority(gate):
         for proc in (first, second):
             proc.kill()
             proc.wait()
+
+
+def test_paused_stable_jobs_wait_while_others_run(gate):
+    assert gate("pause-stable", "--reason", "bench on the other mac").returncode == 0
+    stable = gate("run", "--needs", "gpu", "--stable", "--max-wait", "1", "--", "echo", "ran")
+    assert stable.returncode == 75 and "ran" not in stable.stdout, stable.stderr
+    assert "new --stable jobs are paused (bench on the other mac)" in stable.stderr, stable.stderr
+    plain = gate("run", "--needs", "gpu", "--max-wait", "1", "--", "echo", "ran")
+    assert plain.returncode == 0 and "ran" in plain.stdout, plain.stderr
+    assert "new --stable jobs are paused (bench on the other mac)" in gate("status").stdout
+    override = gate("run", "--needs", "gpu", "--stable", "--max-wait", "5", "--user-override", "now", "--",
+                    "echo", "ran")
+    assert override.returncode == 0 and "ran" in override.stdout, override.stderr
+
+
+def test_resume_lets_a_waiting_stable_job_start(gate):
+    assert gate("pause-stable").returncode == 0
+    waiter = queued_waiter(gate, "--needs", "gpu", "--stable", "--max-wait", "25", "--", "true")
+    resumed = gate("resume-stable")
+    assert resumed.returncode == 0 and "may start again" in resumed.stdout
+    assert waiter.wait(timeout=15) == 0
+    assert "paused" not in gate("status").stdout
+    assert "were not paused" in gate("resume-stable").stdout
+
+
+def test_a_paused_stable_waiter_does_not_hold_back_lower_priorities(gate):
+    assert gate("pause-stable").returncode == 0
+    waiter = queued_waiter(gate, "--needs", "gpu", "--stable", "--priority", "1", "--max-wait", "25", "--", "true")
+    try:
+        plain = gate("run", "--needs", "gpu", "--max-wait", "1", "--", "echo", "ran")
+        assert plain.returncode == 0 and "ran" in plain.stdout, plain.stderr
+    finally:
+        waiter.kill()
+        waiter.wait()
+
+
+@pytest.mark.parametrize("content", ["{not json", "null", '{"since": "unknown"}', '{"since": true}', '{"since": 1' + "0" * 400 + "}", "[" * 100000])
+def test_an_unreadable_pause_still_pauses(gate, tmp_path, content):
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "stable-paused").write_text(content)
+    status = gate("status").stdout
+    assert "new --stable jobs are paused (unreadable pause file); hwgate resume-stable" in status, status
+    stable = gate("run", "--needs", "gpu", "--stable", "--max-wait", "1", "--", "true")
+    assert stable.returncode == 75 and "unreadable pause file" in stable.stderr, stable.stderr
+
+
+def test_pause_is_published_under_the_admission_lock(gate, tmp_path):
+    state = tmp_path / "state"
+    gate("status")  # creates the state dir
+    with open(state / "admit.lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        pause = subprocess.Popen([sys.executable, str(HWGATE), "pause-stable"], env=gate.environ(),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(1.5)
+        assert not (state / "stable-paused").exists()
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    assert pause.wait(timeout=15) == 0
+    assert (state / "stable-paused").exists()
