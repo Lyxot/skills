@@ -14,10 +14,10 @@ Only these models, at these efforts. Pick by how hard the job is, not by habit.
 | Claude | `haiku-5.5` xhigh | `opus-5.5` medium / high | `fable-5.2` high |
 | Codex | `gpt-6-luna` xhigh | `gpt-6.2-sol` medium / high | `gpt-6.2-astra` high |
 | Cursor | — | `grok-4.7-high` | — |
-| Antigravity | — | `gemini-4-hydrogen` high | `gemini-4-argon` / `gemini-4-carbon` high |
+| Antigravity | `gemini-4-hydrogen` high | `gemini-4-neon` medium / high | `gemini-4-argon` / `gemini-4-carbon` high |
 
 - Super easy: lookups, renames, summarising a log, mechanical edits. Very hard: subtle concurrency or numerics, design under real constraints, a bug others missed. Everything else is daily use; take high over medium when the job is long or a mistake is costly.
-- agy also lists Claude, GPT-OSS and Flash models; never use those through agy. `gemini-4-carbon` appears only on some accounts: use it when `agy models` lists it, otherwise `gemini-4-argon`.
+- agy also lists Claude, GPT-OSS, Flash and Orchestrator models; never use those through agy. `gemini-4-carbon` appears only on some accounts: use it when `agy models` lists it, otherwise `gemini-4-argon`.
 - A task's own instructions (a review workflow, say) may narrow this list; they never widen it.
 
 ## Built-in tools first
@@ -81,18 +81,18 @@ jq -r '.result' "$log2" > "$out2"
 ### Antigravity (agy)
 
 ```bash
-# set first, from the table: model=gemini-4-hydrogen|gemini-4-argon|gemini-4-carbon effort=high
-agy --model "${model:?pick from the table}-${effort:?pick from the table}" --dangerously-skip-permissions --output-format json \
-    --print-timeout 0 -p "$prompt" </dev/null > "$log"
+# set first, from the table: model=gemini-4-hydrogen|gemini-4-neon|gemini-4-argon|gemini-4-carbon effort=medium|high
+agy --model "${model:?pick from the table}" --effort "${effort:?pick from the table}" --dangerously-skip-permissions \
+    --output-format json --print-timeout 0 -p "$prompt" </dev/null > "$log"
 session="$(jq -r '.conversation_id // empty' "$log")"; jq -r '.response' "$log" > "$out"
 
-agy --conversation "$session" --model "${model:?pick from the table}-${effort:?pick from the table}" --dangerously-skip-permissions \
-    --output-format json --print-timeout 0 -p "$prompt2" </dev/null > "$log2"
+agy --conversation "$session" --model "${model:?pick from the table}" --effort "${effort:?pick from the table}" \
+    --dangerously-skip-permissions --output-format json --print-timeout 0 -p "$prompt2" </dev/null > "$log2"
 jq -r '.response' "$log2" > "$out2"
 ```
 
 - `-p` takes the prompt as its value, so it goes last, directly before the prompt; anything after it is taken for the prompt and rejected.
-- The effort is part of the model name, so the command joins them (`gemini-4-hydrogen-high`); `agy models` lists the names.
+- The model and effort are separate flags (`--model gemini-4-neon --effort high`); `agy models` lists the models.
 - Result `.response`, session `.conversation_id`; `.status` is `SUCCESS` on success. Without `--dangerously-skip-permissions`, every shell command is denied in print mode and listed under `.denied_actions`, and the response comes back empty.
 - agy truncates a long `AGENTS.md` it loads. When the task depends on rules past the start of the file, tell it to read `AGENTS.md` in full.
 
