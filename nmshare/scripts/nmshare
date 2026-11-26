@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""nmshare: one node_modules install per lockfile, shared across worktrees.
+
+Every Unsloth Studio frontend (the workspace checkout and each worktree under
+$NMSHARE_WORKSPACE, default ~/Github/unsloth) keeps a real, independent node_modules directory, so each
+worktree gets its own .vite cache and .bin without touching another's. The files
+inside are APFS copy-on-write clones of a single install per package-lock.json,
+so a second worktree on the same lockfile costs tens of MB instead of a gigabyte.
+
+  nmshare status          what each frontend has, and which lockfile it needs
+  nmshare sync [path...]  give each frontend a clone of its lockfile's install
+  nmshare gc              delete store installs no frontend asks for any more
+
+A frontend whose lockfile has no install yet is installed with `npm ci` in place
+and then adopted into the store, so the first worktree on a new lockfile pays the
+install and every later one clones it.
+"""
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+WORKSPACE = Path(os.environ.get("NMSHARE_WORKSPACE", "~/Github/unsloth")).expanduser()
+STORE = WORKSPACE / ".nm-store"
+MARKER = ".nmshare"
+
+
+def log(message):
+    print("nmshare: " + message, flush=True)
+
+
+def frontends():
+    roots = [WORKSPACE / "unsloth", *sorted((WORKSPACE / "worktrees").glob("*"))]
+    return [r / "studio/frontend" for r in roots if (r / "studio/frontend/package-lock.json").is_file()]
+
+
+def lock_hash(frontend):
+    data = (frontend / "package-lock.json").read_bytes()
+    return hashlib.sha256(data).hexdigest()[:12]
+
+
+def installed_hash(node_modules):
+    if node_modules.is_symlink():
+        return None  # an old cross-worktree symlink, never this worktree's own install
+    try:
+        return (node_modules / MARKER).read_text().strip()
+    except OSError:
+        return None
+
+
+def discard(node_modules):
+    """Remove a frontend's node_modules without ever following a symlink into another worktree."""
+    if node_modules.is_symlink():
+        node_modules.unlink()
+    elif node_modules.is_dir():
+        shutil.rmtree(node_modules)
+
+
+def clone(src, dst):
+    """APFS clone: the copy shares blocks with the source until either is written.
+
+    Cloned under a private name and renamed into place: `cp -R src dst` into a dst that
+    already exists nests the copy at dst/node_modules instead of failing.
+    """
+    staging = dst.with_name("{}.nmshare-{}".format(dst.name, os.getpid()))
+    discard(staging)
+    subprocess.run(["/bin/cp", "-Rc", str(src), str(staging)], check=True)
+    os.rename(staging, dst)
+
+
+@contextlib.contextmanager
+def store_lock(digest):
+    """Serialises seeding one lockfile: two concurrent seeds once moved the second install inside the first."""
+    STORE.mkdir(parents=True, exist_ok=True)
+    with open(STORE / ".{}.lock".format(digest), "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def du_mb(path):
+    out = subprocess.run(["du", "-sk", str(path)], capture_output=True, text=True).stdout
+    return int(out.split()[0]) / 1024 if out.strip() else 0.0
+
+
+def seed(frontend, digest):
+    """Install this lockfile from scratch and move the result into the store.
+
+    An existing node_modules is never adopted as-is: installs collect build caches and
+    stray packages over time, and one crufty copy would be cloned into every worktree.
+    """
+    log("seeding {}: npm ci in {}".format(digest, frontend.parent.parent.name))
+    discard(frontend / "node_modules")
+    subprocess.run(["npm", "ci", "--no-audit", "--no-fund"], cwd=frontend, check=True)
+    target = STORE / digest
+    target.mkdir(parents=True, exist_ok=True)
+    staging = target / "node_modules.nmshare-{}".format(os.getpid())
+    discard(staging)
+    shutil.move(str(frontend / "node_modules"), str(staging))
+    (staging / MARKER).write_text(digest + "\n")
+    shutil.copy2(frontend / "package-lock.json", target / "package-lock.json")
+    os.rename(staging, target / "node_modules")
+
+
+def sync(frontend, force=False):
+    digest = lock_hash(frontend)
+    node_modules = frontend / "node_modules"
+    store = STORE / digest / "node_modules"
+    if installed_hash(node_modules) == digest and not force:
+        return "current"
+    with store_lock(digest):
+        seeded = not store.exists()
+        if seeded:
+            seed(frontend, digest)
+    discard(node_modules)
+    clone(store, node_modules)
+    return "seeded store, cloned" if seeded else "cloned"
+
+
+def cmd_status(_args):
+    store_digests = {p.name for p in STORE.glob("*") if (p / "node_modules").is_dir()} if STORE.is_dir() else set()
+    print("store: {} ({} install{}, {:.1f} GB logical)".format(
+        STORE, len(store_digests), "" if len(store_digests) == 1 else "s", du_mb(STORE) / 1024 if STORE.is_dir() else 0))
+    for frontend in frontends():
+        digest = lock_hash(frontend)
+        node_modules = frontend / "node_modules"
+        if node_modules.is_symlink():
+            other = os.path.realpath(node_modules)
+            state = "symlink -> {}{}".format(other, "  WRONG LOCKFILE" if lock_hash(frontend) != _hash_of_install_dir(other) else "")
+        elif not node_modules.is_dir():
+            state = "missing"
+        elif installed_hash(node_modules) == digest:
+            state = "shared"
+        elif installed_hash(node_modules):
+            state = "stale (lockfile changed)"
+        else:
+            state = "private install, {:.1f} GB".format(du_mb(node_modules) / 1024)
+        print("  {:<44} {}  {}".format(frontend.parent.parent.name, digest, state))
+    return 0
+
+
+def _hash_of_install_dir(node_modules):
+    """The lockfile hash of whichever frontend owns this install directory."""
+    lock = Path(node_modules).parent / "package-lock.json"
+    return hashlib.sha256(lock.read_bytes()).hexdigest()[:12] if lock.is_file() else None
+
+
+def cmd_sync(args):
+    # Relative paths are taken from the workspace when they do not exist from here.
+    targets = [Path(p).resolve() if Path(p).exists() else (WORKSPACE / p).resolve() for p in args.path]
+    if not targets:
+        # Default to repairing what exists; an untouched worktree stays untouched.
+        targets = [f for f in frontends() if args.all or (f / "node_modules").exists() or (f / "node_modules").is_symlink()]
+    for frontend in targets:
+        if not (frontend / "package-lock.json").is_file():
+            frontend = frontend / "studio/frontend"
+        log("{}: {}".format(frontend.parent.parent.name, sync(frontend, args.force)))
+    return 0
+
+
+def cmd_gc(_args):
+    wanted = {lock_hash(f) for f in frontends()}
+    for entry in sorted(STORE.glob("*")) if STORE.is_dir() else []:
+        if entry.is_dir() and entry.name not in wanted:
+            shutil.rmtree(entry)
+            log("removed unused store install " + entry.name)
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="nmshare", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("status", help="show what each frontend has")
+    run = sub.add_parser("sync", help="clone the right install into each frontend")
+    run.add_argument("path", nargs="*", help="worktree or frontend paths (default: all)")
+    run.add_argument("--force", action="store_true", help="re-clone even when already shared")
+    run.add_argument("--all", action="store_true", help="also install frontends that have no node_modules yet")
+    sub.add_parser("gc", help="delete store installs no frontend asks for")
+    args = parser.parse_args()
+    return {"status": cmd_status, "sync": cmd_sync, "gc": cmd_gc}[args.action](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
