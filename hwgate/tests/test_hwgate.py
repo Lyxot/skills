@@ -615,7 +615,7 @@ def test_status_lists_waiting_jobs_by_arrival_and_tags_whole_slot_takers(gate):
         assert "needs gpu, waiting" in lines[first] and "whole slot" not in lines[first], status
         assert "slot is full" in lines[first + 1] and lines[first + 2].strip() == "echo older", status
         assert "--stable, needs gpu+cpu" in lines[second], status
-        assert "by priority, then jobs without --stable, then arrival; within that there is no fixed order" in status
+        assert "by priority, then jobs without --stable, then earliest arrival" in status
         # It gives way to the older waiter, so it holds no barrier against it.
         assert "whole slot" not in lines[second], status
         assert "pid {} is waiting without --stable and goes first".format(older.pid) in lines[second + 1], status
@@ -1262,9 +1262,10 @@ def test_min_freq_ratio_needs_stable_and_a_fraction(gate, args):
 FAN_HELPER = """#!{python}
 import fcntl, os, sys, time
 mode = sys.argv[1]
-if mode == "auto":
-    # Recorded as plain "auto" only while the run still holds its slot.
-    with open(os.path.join(os.environ["HWGATE_STATE_DIR"], "gpu.lock")) as lock:
+slot_lock = os.path.join(os.environ["HWGATE_STATE_DIR"], "gpu.lock")
+if mode == "auto" and os.path.exists(slot_lock):
+    # Recorded as plain "auto" only while the run still holds its slot (a waiter never had one).
+    with open(slot_lock) as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             mode = "auto-after-the-slot-was-freed"
@@ -1313,49 +1314,104 @@ def fan_calls(calls):
     return calls.read_text().split() if calls.exists() else []
 
 
-def test_a_stable_run_pins_the_fans_before_the_job_and_hands_them_back_after(gate, tmp_path):
+def busy_file(tmp_path, busy=1.0):
+    """A forced frequency file whose GPU is `busy`; rewrite it to change the load mid-run."""
+    path = tmp_path / "busy.json"
+    path.write_text(json.dumps({"gpu": [1000, busy]}))
+    return path
+
+
+@pytest.mark.parametrize("busy, expected", [(1.0, ["max", "auto"]), (0.3, ["auto"]), (0.0, ["auto"])],
+                         ids=["busy", "light", "idle"])
+def test_a_stable_run_pins_the_fans_only_once_the_job_is_busy(gate, tmp_path, busy, expected):
     helper, calls = fake_fan_helper(tmp_path)
-    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "cat", str(calls),
-                  HWGATE_FAN_CMD=helper)
+    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sleep", "4",
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_FREQ=busy_file(tmp_path, busy))
     assert result.returncode == 0, result.stderr
-    assert result.stdout.split() == ["max"]
-    assert fan_calls(calls) == ["max", "auto"]
-    calls.unlink()
-    assert gate("run", "--needs", "gpu", "--", "true", HWGATE_FAN_CMD=helper).returncode == 0
-    assert fan_calls(calls) == []
+    assert fan_calls(calls) == expected, result.stderr
+    assert ("the job is busy; fans pinned at maximum" in result.stderr) is ("max" in expected), result.stderr
 
 
-@pytest.mark.parametrize("command", [["false"], ["/nonexistent/job"]], ids=["job-fails", "job-cannot-start"])
-def test_the_fans_are_handed_back_however_the_job_ends(gate, tmp_path, command):
+def test_fans_go_back_to_automatic_while_the_job_idles(gate, tmp_path):
     helper, calls = fake_fan_helper(tmp_path)
-    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", *command, HWGATE_FAN_CMD=helper)
-    assert result.returncode != 0
+    freq = busy_file(tmp_path)
+    idle = json.dumps({"gpu": [1000, 0.0]})
+    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sh", "-c",
+                  "sleep 4; echo '{0}' > {1}.new; mv {1}.new {1}; sleep 4".format(idle, freq),
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_FREQ=freq, HWGATE_FAN_IDLE_AFTER=1)
+    assert result.returncode == 0, result.stderr
     assert fan_calls(calls) == ["max", "auto"], result.stderr
+    assert "the job is idle; fans back on automatic" in result.stderr, result.stderr
+
+
+def test_an_idle_job_hands_back_fans_it_did_not_pin(gate, tmp_path):
+    helper, calls = fake_fan_helper(tmp_path)
+    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sleep", "5",
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_FREQ=busy_file(tmp_path, 0.0), HWGATE_FAN_IDLE_AFTER=1)
+    assert result.returncode == 0, result.stderr
+    assert fan_calls(calls) == ["auto"], result.stderr
+    assert "the job is idle; fans back on automatic" in result.stderr, result.stderr
+
+
+def test_a_failed_hand_back_is_still_owed_at_exit(gate, tmp_path):
+    # One idle hand-back fails partway through the run; exit tries again.
+    helper, calls = fake_fan_helper(tmp_path, fail=["auto"])
+    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sleep", "5",
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_FREQ=busy_file(tmp_path, 0.0), HWGATE_FAN_IDLE_AFTER=3)
+    assert fan_calls(calls) == ["auto", "auto"], result.stderr
+    assert "fans back on automatic" not in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("needs, readings", [
+    ("gpu", None), ("gpu", {"cpu": [3000, 0.0]}), ("gpu,cpu", {"cpu": [3000, 0.0]}),
+], ids=["no-sampler", "no-gpu-channel", "idle-cpu-no-gpu-channel"])
+def test_without_busy_readings_the_fans_are_pinned(gate, tmp_path, needs, readings):
+    helper, calls = fake_fan_helper(tmp_path)
+    freq = tmp_path / "freq.json"
+    if readings is not None:
+        freq.write_text(json.dumps(readings))
+    result = gate("run", "--needs", needs, "--stable", "--max-wait", "3", "--", "sleep", "3",
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_FREQ=freq)
+    assert fan_calls(calls) == ["max", "auto"], result.stderr
+    assert "no busy readings, so the fans are pinned" in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("command, expected", [(["false"], ["auto"]), (["/nonexistent/job"], [])],
+                         ids=["job-fails", "job-cannot-start"])
+def test_the_fans_are_handed_back_however_the_job_ends(gate, tmp_path, command, expected):
+    helper, calls = fake_fan_helper(tmp_path)
+    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", *command, HWGATE_FAN_CMD=helper,
+                  HWGATE_FORCE_FREQ=busy_file(tmp_path))
+    assert result.returncode != 0
+    assert fan_calls(calls) == expected, result.stderr
 
 
 def test_a_failed_pin_still_runs_the_job_and_hands_back_what_it_took(gate, tmp_path):
     helper, calls = fake_fan_helper(tmp_path, fail=["max"])
-    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "echo", "ran", HWGATE_FAN_CMD=helper)
+    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sh", "-c", "sleep 4; echo ran",
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_FREQ=busy_file(tmp_path))
     assert result.returncode == 0 and "ran" in result.stdout
     assert "could not pin the fans: no SMC" in result.stderr
     assert fan_calls(calls) == ["max", "auto"]
 
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP, signal.SIGINT], ids=lambda s: s.name)
-def test_a_signal_while_the_fans_are_being_pinned_still_hands_them_back(gate, tmp_path, sig):
-    helper, calls = fake_fan_helper(tmp_path, block=["max"])
+def test_a_signal_during_the_run_reaches_the_job_and_hands_the_fans_back(gate, tmp_path, sig):
+    helper, calls = fake_fan_helper(tmp_path, block=["max"], block_seconds=3)
+    termed = tmp_path / "termed"
     wrapper = subprocess.Popen(
-        [sys.executable, str(HWGATE), "run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "touch",
-         str(tmp_path / "ran")], env=gate.environ(HWGATE_FAN_CMD=helper),
+        [sys.executable, str(HWGATE), "run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sh", "-c",
+         "trap 'touch {}; exit 1' TERM; sleep 30 & wait".format(termed)],
+        env=gate.environ(HWGATE_FAN_CMD=helper, HWGATE_FORCE_FREQ=busy_file(tmp_path)),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     until = time.time() + 15
     while fan_calls(calls) != ["max"]:
         assert time.time() < until and wrapper.poll() is None, "the pin never started"
         time.sleep(0.05)
     wrapper.send_signal(sig)
-    assert wrapper.wait(timeout=20) == 128 + sig
+    assert wrapper.wait(timeout=20) == 1
     assert fan_calls(calls) == ["max", "auto"]
-    assert not (tmp_path / "ran").exists()
+    assert termed.exists(), "the job was not sent SIGTERM"
 
 
 def test_without_the_helper_a_stable_run_says_how_to_install_it(gate, tmp_path):
@@ -1384,6 +1440,15 @@ def test_status_tells_how_to_release_fans_no_stable_run_holds(gate, tmp_path, re
         assert "fans:" not in status, status
 
 
+def test_status_does_not_tell_to_release_fans_a_waiting_job_holds(gate, tmp_path):
+    helper, _ = fake_fan_helper(tmp_path, status=pinned_report(4500))
+    gate("status")
+    with open(tmp_path / "state" / "fans.lock", "a+") as waiter:
+        fcntl.flock(waiter, fcntl.LOCK_SH)
+        status = gate("status", HWGATE_FAN_CMD=helper).stdout
+    assert "fans: pinned at 90% of maximum" in status and "restore with" not in status, status
+
+
 @pytest.mark.parametrize("report, shown", [
     ("fan 0: 5000 rpm, manual", "at maximum"),
     (pinned_report(5000), "at maximum"),
@@ -1401,11 +1466,12 @@ def test_status_shows_a_stable_runs_live_fan_level_without_calling_it_left_behin
 @pytest.mark.parametrize("level, shown", [(None, "at maximum"), (100, "at maximum"), (85, "at 85% of maximum")])
 def test_a_stable_run_logs_the_level_the_helper_pinned_at(gate, tmp_path, level, shown):
     helper, _ = fake_fan_helper(tmp_path, level=level)
-    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "true", HWGATE_FAN_CMD=helper)
-    assert "fans pinned {} until the job exits".format(shown) in result.stderr, result.stderr
+    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sleep", "4", HWGATE_FAN_CMD=helper,
+                  HWGATE_FORCE_FREQ=busy_file(tmp_path))
+    assert "the job is busy; fans pinned {}".format(shown) in result.stderr, result.stderr
 
 
-def heats_up(tmp_path, seconds="3", heat=True):
+def heats_up(tmp_path, seconds="6", heat=True):
     """A job that moves the forced thermal state to fair (or leaves it nominal), then keeps running."""
     thermal = tmp_path / "thermal"
     thermal.write_text("0")
@@ -1422,7 +1488,7 @@ def test_heat_raises_fans_pinned_below_maximum_once(gate, tmp_path, level, heat,
     helper, calls = fake_fan_helper(tmp_path, level=level)
     thermal, job = heats_up(tmp_path, heat=heat)
     result = gate("run", "--needs", "gpu", "--stable", "--throttle-budget", "30", "--max-wait", "3", "--", *job,
-                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal)
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal, HWGATE_FORCE_FREQ=busy_file(tmp_path))
     assert result.returncode == 0, result.stderr
     assert fan_calls(calls) == expected, result.stderr
     assert ("fans raised to maximum" in result.stderr) == ("full" in expected), result.stderr
@@ -1430,9 +1496,25 @@ def test_heat_raises_fans_pinned_below_maximum_once(gate, tmp_path, level, heat,
 
 def test_fans_are_handed_back_only_after_a_boost_finishes(gate, tmp_path):
     helper, calls = fake_fan_helper(tmp_path, level=90, block=["full"], block_seconds=3)
-    thermal, job = heats_up(tmp_path, seconds="1.5")
+    thermal, job = heats_up(tmp_path, seconds="4")
     result = gate("run", "--needs", "gpu", "--stable", "--throttle-budget", "30", "--max-wait", "3", "--", *job,
-                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal)
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal, HWGATE_FORCE_FREQ=busy_file(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert fan_calls(calls) == ["max", "full", "full-done", "auto"], result.stderr
+
+
+def test_a_hand_back_still_queued_when_the_job_ends_is_not_lost(gate, tmp_path):
+    # The boost is still running when the job exits, so the hand-back the idle job asked for is still queued.
+    helper, calls = fake_fan_helper(tmp_path, level=90, block=["full"], block_seconds=12)
+    thermal = tmp_path / "thermal"
+    thermal.write_text("0")
+    freq = busy_file(tmp_path)
+    idle = json.dumps({"gpu": [1000, 0.0]})
+    result = gate("run", "--needs", "gpu", "--stable", "--throttle-budget", "30", "--max-wait", "3", "--", "sh", "-c",
+                  "sleep 3; echo 1 > {2}; sleep 1; echo '{0}' > {1}.new; mv {1}.new {1}; sleep 6".format(
+                      idle, freq, thermal),
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal, HWGATE_FORCE_FREQ=freq,
+                  HWGATE_FAN_IDLE_AFTER=1)
     assert result.returncode == 0, result.stderr
     assert fan_calls(calls) == ["max", "full", "full-done", "auto"], result.stderr
 
@@ -1442,9 +1524,10 @@ def test_a_slow_boost_does_not_hold_up_the_watch(gate, tmp_path):
     helper, calls = fake_fan_helper(tmp_path, level=90, block=["full"], block_seconds=10)
     thermal, _ = heats_up(tmp_path)
     job = ["sh", "-c", "trap 'echo killed >> {0}; exit 1' TERM; echo 1 > {1}; sleep 30 & wait".format(calls, thermal)]
-    result = gate("run", "--needs", "gpu", "--stable", "--throttle-budget", "30", "--timeout", "4", "--max-wait", "3",
-                  "--", *job, HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal)
-    assert "timeout after 4.0s" in result.stderr, result.stderr
+    result = gate("run", "--needs", "gpu", "--stable", "--throttle-budget", "30", "--timeout", "6", "--max-wait", "3",
+                  "--", *job, HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal,
+                  HWGATE_FORCE_FREQ=busy_file(tmp_path))
+    assert "timeout after 6.0s" in result.stderr, result.stderr
     assert fan_calls(calls) == ["max", "full", "killed", "full-done", "auto"], result.stderr
 
 
@@ -1452,10 +1535,24 @@ def test_a_refused_boost_is_reported_once_and_the_run_goes_on(gate, tmp_path):
     helper, calls = fake_fan_helper(tmp_path, level=90, fail=["full"])
     thermal, job = heats_up(tmp_path)
     result = gate("run", "--needs", "gpu", "--stable", "--throttle-budget", "30", "--max-wait", "3", "--", *job,
-                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal)
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal, HWGATE_FORCE_FREQ=busy_file(tmp_path))
     assert result.returncode == 0, result.stderr
     assert result.stderr.count("fans could not be raised to maximum (no SMC)") == 1, result.stderr
     assert fan_calls(calls) == ["max", "full", "auto"], result.stderr
+
+
+def test_a_running_job_does_not_hand_back_fans_another_job_holds(gate, tmp_path):
+    helper, calls = fake_fan_helper(tmp_path)
+    freq = busy_file(tmp_path)
+    idle = json.dumps({"gpu": [1000, 0.0]})
+    gate("status")
+    with open(tmp_path / "state" / "fans.lock", "a+") as other:
+        fcntl.flock(other, fcntl.LOCK_SH)
+        result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "3", "--", "sh", "-c",
+                      "sleep 4; echo '{0}' > {1}.new; mv {1}.new {1}; sleep 3".format(idle, freq),
+                      HWGATE_FAN_CMD=helper, HWGATE_FORCE_FREQ=freq, HWGATE_FAN_IDLE_AFTER=1)
+    assert fan_calls(calls) == ["max"], result.stderr
+    assert "fans stay pinned for another --stable job" in result.stderr, result.stderr
 
 
 def test_a_nested_job_is_charged_what_it_declares_beyond_its_parent(gate):
@@ -1898,7 +1995,7 @@ def test_status_lists_waiters_by_priority(gate):
         status = wait_for_status(gate, "queue: 2 waiting")
         assert status.index("pid {}:".format(second.pid)) < status.index("pid {}:".format(first.pid)), status
         line = next(line for line in status.splitlines() if "pid {}:".format(second.pid) in line)
-        assert "priority 2" in line and "by priority, then jobs without --stable, then arrival" in status, status
+        assert "priority 2" in line and "by priority, then jobs without --stable, then earliest arrival" in status, status
     finally:
         for proc in (first, second):
             proc.kill()
@@ -1962,3 +2059,150 @@ def test_pause_is_published_under_the_admission_lock(gate, tmp_path):
         fcntl.flock(lock, fcntl.LOCK_UN)
     assert pause.wait(timeout=15) == 0
     assert (state / "stable-paused").exists()
+
+
+def test_jobs_start_in_arrival_order_within_a_priority(gate):
+    gate.background("run", "--needs", "cpu", "--cpus", "4", "--", "sleep", "20")
+    earlier = queued_waiter(gate, "--needs", "cpu", "--cpus", "6", "--max-wait", "25", "--", "true")
+    try:
+        # It would fit the budget, but the earlier waiter goes first.
+        later = gate("run", "--needs", "cpu", "--cpus", "1", "--max-wait", "1", "--", "echo", "ran")
+        assert later.returncode == 75, later.stderr
+        assert "pid {} has waited longer and goes first".format(earlier.pid) in later.stderr, later.stderr
+    finally:
+        earlier.kill()
+        earlier.wait()
+
+
+def test_an_earlier_stable_waiter_does_not_hold_back_later_shared_work(gate):
+    gate.background("run", "--needs", "cpu", "--cpus", "4", "--", "sleep", "20")
+    stable = queued_waiter(gate, "--needs", "gpu", "--stable", "--max-wait", "25", "--", "true", HWGATE_COOLDOWN=0)
+    try:
+        later = gate("run", "--needs", "cpu", "--cpus", "1", "--max-wait", "1", "--", "echo", "ran")
+        assert later.returncode == 0 and "ran" in later.stdout, later.stderr
+    finally:
+        stable.kill()
+        stable.wait()
+
+
+@pytest.mark.parametrize("thermal, paused, expected", [
+    ("1", False, ["max", "auto"]),
+    ("0", False, []),
+    ("1", True, []),
+], ids=["fair", "nominal", "paused"])
+def test_a_stable_job_waiting_for_nominal_pins_the_fans(gate, tmp_path, thermal, paused, expected):
+    helper, calls = fake_fan_helper(tmp_path, level=90)
+    if paused:
+        assert gate("pause-stable").returncode == 0
+    if thermal == "0":
+        for _ in range(3):
+            gate.background("run", "--needs", "gpu", "--", "sleep", "20")
+    result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "2", "--", "true",
+                  HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal)
+    assert result.returncode == 75, result.stderr
+    assert fan_calls(calls) == expected, result.stderr
+    assert ("fans pinned at 90% of maximum while it waits for nominal heat" in result.stderr) is bool(expected)
+
+
+def test_pausing_stable_admission_hands_back_a_waiters_pin(gate, tmp_path):
+    helper, calls = fake_fan_helper(tmp_path, level=90)
+    waiter = subprocess.Popen(
+        [sys.executable, str(HWGATE), "run", "--needs", "gpu", "--stable", "--max-wait", "20", "--", "true"],
+        env=gate.environ(HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=1),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    until = time.time() + 15
+    while fan_calls(calls) != ["max"]:
+        assert time.time() < until and waiter.poll() is None, "the waiting pin never happened"
+        time.sleep(0.05)
+    assert gate("pause-stable").returncode == 0
+    until = time.time() + 15
+    while fan_calls(calls) != ["max", "auto"]:
+        assert time.time() < until and waiter.poll() is None, fan_calls(calls)
+        time.sleep(0.05)
+    time.sleep(1)  # the helper records auto before the waiter logs it
+    waiter.terminate()
+    _, err = waiter.communicate(timeout=20)
+    assert fan_calls(calls) == ["max", "auto"], err
+    assert "admission is paused; fans back on automatic" in err, err
+
+
+def test_a_paused_waiter_keeps_owing_a_hand_back_that_failed(gate, tmp_path):
+    helper, calls = fake_fan_helper(tmp_path, level=90, fail=["auto"])
+    waiter = subprocess.Popen(
+        [sys.executable, str(HWGATE), "run", "--needs", "gpu", "--stable", "--max-wait", "20", "--", "true"],
+        env=gate.environ(HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=1),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    until = time.time() + 15
+    while fan_calls(calls) != ["max"]:
+        assert time.time() < until and waiter.poll() is None, "the waiting pin never happened"
+        time.sleep(0.05)
+    assert gate("pause-stable").returncode == 0
+    until = time.time() + 15
+    while "auto" not in fan_calls(calls):
+        assert time.time() < until and waiter.poll() is None, fan_calls(calls)
+        time.sleep(0.05)
+    waiter.terminate()
+    _, err = waiter.communicate(timeout=20)
+    assert fan_calls(calls).count("auto") >= 2, err
+
+
+def test_a_waiter_hands_back_its_pin_once_the_heat_is_nominal(gate, tmp_path):
+    helper, calls = fake_fan_helper(tmp_path, level=90)
+    thermal = tmp_path / "thermal"
+    thermal.write_text("1")
+    waiter = subprocess.Popen(
+        [sys.executable, str(HWGATE), "run", "--needs", "gpu", "--stable", "--max-wait", "20", "--", "true"],
+        env=gate.environ(HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=thermal),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    until = time.time() + 15
+    while fan_calls(calls) != ["max"]:
+        assert time.time() < until and waiter.poll() is None, "the waiting pin never happened"
+        time.sleep(0.05)
+    thermal.write_text("0")
+    until = time.time() + 15
+    while fan_calls(calls) != ["max", "auto"]:
+        assert time.time() < until and waiter.poll() is None, fan_calls(calls)
+        time.sleep(0.05)
+    time.sleep(1)  # the helper records auto before the waiter logs it
+    waiter.terminate()
+    _, err = waiter.communicate(timeout=20)
+    assert fan_calls(calls) == ["max", "auto"], err
+    assert "the heat is back to nominal; fans back on automatic" in err, err
+
+
+def test_a_signal_while_a_waiter_hands_back_its_pin_still_hands_it_back(gate, tmp_path):
+    helper, calls = fake_fan_helper(tmp_path, level=90, block=["auto"], block_seconds=3)
+    waiter = subprocess.Popen(
+        [sys.executable, str(HWGATE), "run", "--needs", "gpu", "--stable", "--max-wait", "30", "--", "true"],
+        env=gate.environ(HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=1),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    until = time.time() + 15
+    while fan_calls(calls) != ["max"]:
+        assert time.time() < until and waiter.poll() is None, "the waiting pin never happened"
+        time.sleep(0.05)
+    assert gate("pause-stable").returncode == 0
+    until = time.time() + 15
+    while fan_calls(calls) != ["max", "auto"]:
+        assert time.time() < until and waiter.poll() is None, fan_calls(calls)
+        time.sleep(0.05)
+    waiter.terminate()
+    waiter.communicate(timeout=20)
+    assert fan_calls(calls) == ["max", "auto", "auto"]
+
+
+def test_a_waiter_leaves_fans_another_job_holds_alone(gate, tmp_path):
+    helper, calls = fake_fan_helper(tmp_path, level=90)
+    gate("status")
+    with open(tmp_path / "state" / "fans.lock", "a+") as other:
+        fcntl.flock(other, fcntl.LOCK_SH)
+        result = gate("run", "--needs", "gpu", "--stable", "--max-wait", "2", "--", "true",
+                      HWGATE_FAN_CMD=helper, HWGATE_FORCE_THERMAL=1)
+    assert result.returncode == 75, result.stderr
+    assert fan_calls(calls) == [], result.stderr
+
+
+def test_status_reports_the_current_frequency(gate, tmp_path):
+    freq = tmp_path / "freq.json"
+    freq.write_text(json.dumps({"gpu": [1000, 0.5], "cpu": [0, 0]}))
+    status = gate("status", HWGATE_FORCE_FREQ=freq).stdout
+    assert "frequency now: cpu idle; gpu 1000 MHz, 50% busy" in status, status

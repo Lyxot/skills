@@ -37,7 +37,7 @@ job waiting for a whole slot raises a barrier, so overlapping sharers cannot
 starve it. --priority N (default 0) orders waiters: a job does not start while
 one with a higher priority waits for a slot it needs, and drops any barrier it
 holds; at equal priority a --stable job likewise gives way to a waiting job
-without --stable; otherwise equal priorities keep the order above. A job admitted onto a slot that others already hold is told which
+without --stable; otherwise the job that has waited longest goes first. A job admitted onto a slot that others already hold is told which
 ones, because sharing is the one admission outcome that changes how the job runs
 without making it wait, and nothing else in its output would reveal it.
 
@@ -74,10 +74,12 @@ Stable-performance jobs (--stable: benchmarks, timing or throughput runs):
     rather than passed. The counters are machine-wide, and the window includes
     loading and warmup. A job that fails keeps its own exit status. The
     report adds GPU_CLTM residency (the thermal manager) as evidence only;
-  - run with every fan pinned (at its maximum unless the helper's
-    hwgate-fan.conf sets a lower share, raised to maximum for the rest of
-    the job once the heat leaves nominal), handed back to macOS when the
-    job exits, through `sudo -n` on a root helper that
+  - pin every fan while the job keeps its units busy (at maximum unless the
+    helper's hwgate-fan.conf sets a lower share, raised to maximum once the
+    heat leaves nominal) and hand them back to macOS while it idles and when
+    it exits; a --stable job waiting for nominal heat pins them too when no
+    other job holds them, and the last holder hands them back. All through
+    `sudo -n` on a root helper that
     scripts/install-fan-helper.sh installs and a NOPASSWD rule allows;
     hwgate itself never runs as root;
   - are reminded on exit, past HWGATE_STABLE_SPLIT_HINT seconds, to give each
@@ -560,7 +562,27 @@ class FreqSampler:
                 acc[1] += residency
                 level += 1
         cf.CFRelease(delta)
-        return {slot: (w / busy if busy else 0.0, busy / total if total else 0.0) for slot, (w, busy, total) in totals.items()}
+        # A unit with no residency at all has no channel here, which is not the same as idle.
+        return {slot: (w / busy if busy else 0.0, busy / total) for slot, (w, busy, total) in totals.items() if total}
+
+
+def current_frequencies(window=0.25):
+    """Each unit's busy-weighted MHz over a short window, for status; empty when unreadable."""
+    try:
+        sampler = FreqSampler(sorted(FREQ_SOURCES))
+        time.sleep(0 if sampler.forced else window)
+        freqs = sampler.sample()
+    except Exception:
+        return ""
+
+    def show(slot, mhz, busy):
+        if not busy:
+            return "{} idle".format(slot)
+        # Without its DVFS table a unit's states are only ordered, not in MHz.
+        known = sampler.forced or sampler.tables.get(slot)
+        return "{} {}{:.0f}% busy".format(slot, "{:.0f} MHz, ".format(mhz) if known else "", 100 * busy)
+
+    return "; ".join(show(s, mhz, busy) for s, (mhz, busy) in sorted(freqs.items()))
 
 
 class ThrottleWatch:
@@ -575,6 +597,8 @@ class ThrottleWatch:
         self.peak_state = NOMINAL
         self.since = None
         self.low_since = {}
+        # Busiest watched unit in the last sample; None without readings.
+        self.busy = None
         unknown = [s for s in self.slots if s not in self.max_mhz]
         if min_ratio and unknown:
             log("cannot read the hardware maximum frequency of {}; --min-freq-ratio is not enforced there".format(
@@ -597,6 +621,8 @@ class ThrottleWatch:
                 log("lost CPU/GPU frequency readings ({}); --stable treats any thermal state above nominal as throttling".format(e))
         slow, low = [], []
         now = time.time()
+        # A unit without readings could be the busy one, so the fans are not handed back on the others.
+        self.busy = max(freqs[s][1] for s in self.slots) if all(s in freqs for s in self.slots) else None
         for slot in self.slots:
             mhz, busy = freqs.get(slot, (0.0, 0.0))
             if state == NOMINAL and self.sampler:
@@ -810,69 +836,231 @@ def fan_level(percent):
     return "at {}% of maximum".format(percent) if percent < 100 else "at maximum"
 
 
-_fans_owed = False
-_fans_below_max = False
-_boost = None
+# A --stable run pins the fans once a unit it watches stays this busy for FAN_PIN_AFTER seconds, and
+# hands them back after FAN_IDLE_AFTER seconds below FAN_IDLE_BUSY, so loading and teardown stay quiet.
+FAN_PIN_BUSY, FAN_IDLE_BUSY = 0.5, 0.2
+FAN_PIN_AFTER = 2.0
+FAN_IDLE_AFTER = float(os.environ.get("HWGATE_FAN_IDLE_AFTER", "20"))
+
+# Each job that may change the fans holds a shared flock on fans.lock; one that wants to act alone
+# (a waiter's pin, a hand-back) must first get it exclusively, so only a lone holder touches them.
+_fan_hold = None
+_run_fans = None
+_waiter_pinned = False
+_fan_exit_hooked = False
 
 
 def _exit_on_signal(signum, _frame):
     sys.exit(128 + signum)
 
 
-def pin_fans():
-    """Pin the fans for a --stable run; release_fans() hands them back."""
-    global _fans_owed, _fans_below_max
-    if not FAN_CMD:
+def _fan_lock():
+    return os.open(os.path.join(STATE_DIR, "fans.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+
+
+def hold_fans(fd=None):
+    """Keep a shared hold on the fans until release_fans(); with fd, downgrade that exclusive lock."""
+    global _fan_hold, _fan_exit_hooked
+    if _fan_hold is not None:
         return
-    if not fan_helper_installed():
-        log("--stable: fans left on automatic; scripts/install-fan-helper.sh would pin them")
+    if fd is None:
+        fd = _fan_lock()
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    _fan_hold = fd
+    if not _fan_exit_hooked:
+        _fan_exit_hooked = True
+        atexit.register(release_fans)
+
+
+def hand_back_fans(keep_hold):
+    """Fans to automatic unless another job holds them: True if done, False if held, None if auto failed."""
+    global _fan_hold
+    fd = _fan_lock()
+    if _fan_hold is not None:
+        os.close(_fan_hold)
+    # Recorded as the hold throughout, so a signal mid-way still leaves release_fans something to hand back.
+    _fan_hold = fd
+    done = False
+    # A status probe holds the lock for an instant, so a few tries tell it apart from another job's hold.
+    for _ in range(5):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            time.sleep(0.05)
+            continue
+        # Held exclusively until auto is done, so a job pinning meanwhile does so after it.
+        try:
+            run_fans("auto")
+            done = True
+        except OSError as e:
+            log("--stable: could not return the fans to automatic ({}); run: {} auto".format(e, " ".join(FAN_CMD)))
+            done = None
+        break
+    if keep_hold:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+    else:
+        os.close(fd)
+        _fan_hold = None
+    return done
+
+
+def pin_fans_while_waiting():
+    """A --stable job waiting for nominal pins the fans once, only when no other job holds them."""
+    global _waiter_pinned, _fan_hold, _fan_exit_hooked
+    if _waiter_pinned or _fan_hold is not None or not FAN_CMD or not fan_helper_installed():
         return
-    # Owed before the helper runs: a failed or interrupted pin may still have taken some fans.
-    _fans_owed = True
+    fd = _fan_lock()
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return
+    _waiter_pinned, _fan_hold, _fan_exit_hooked = True, fd, True
     atexit.register(release_fans)
-    # Until the job's signal forwarding takes over, a signal must unwind through atexit.
+    # The job's signal forwarding is not in place yet, so a signal must unwind through atexit.
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _exit_on_signal)
     try:
         percent = pinned_percent(run_fans("max"))
-        _fans_below_max = percent < 100
-        log("--stable: fans pinned {} until the job exits{}".format(
-            fan_level(percent), ", or raised to maximum once the heat leaves nominal" if _fans_below_max else ""))
+        log("--stable: heat above nominal while waiting; fans pinned {} while it waits for nominal heat".format(
+            fan_level(percent)))
     except OSError as e:
-        log("--stable: could not pin the fans: {}".format(e))
+        log("--stable: could not pin the fans while waiting: {}".format(e))
+    fcntl.flock(fd, fcntl.LOCK_SH)
 
 
-def boost_fans():
-    """Once per run, in the background: the throttle watch must not wait on the helper."""
-    global _boost
-    if not _fans_below_max or _boost:
-        return
+def unpin_waiter(why):
+    """A waiter gives back the pin it took once it no longer waits on heat; it may pin again if that changes."""
+    global _waiter_pinned, _fan_hold
+    done = hand_back_fans(keep_hold=True)
+    if done is None:
+        return  # still owed: the next poll, or exit, tries again
+    _waiter_pinned = False
+    os.close(_fan_hold)
+    _fan_hold = None
+    if done:
+        log("--stable: {}; fans back on automatic while this job waits".format(why))
 
-    def full():
-        try:
-            run_fans("full")
-            log("--stable: heat left nominal; fans raised to maximum until the job exits")
-        except OSError as e:
-            log("--stable: heat left nominal, but the fans could not be raised to maximum ({}); rerun "
-                "scripts/install-fan-helper.sh and add the sudoers line it prints".format(e))
 
-    thread = threading.Thread(target=full, daemon=True)
-    thread.start()
-    _boost = thread
+def fans_held():
+    """Whether some hwgate job holds fans.lock, and so will hand the fans back itself."""
+    fd = _fan_lock()
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+class RunFans:
+    """The fans of a running --stable job, set from the throttle watch's busy readings off its loop."""
+
+    def __init__(self):
+        self.pinned = self.boosted = self.below_max = False
+        # Set only by the worker: a hand-back is owed until one lands. Fans may already be pinned by a
+        # job that has since gone, so a run starts owing one.
+        self.owed = True
+        self.busy_since = self.idle_since = None
+        self.jobs = queue.Queue()
+        self.worker = threading.Thread(target=self._work, daemon=True)
+        hold_fans()
+        self.worker.start()
+        log("--stable: fans pin once the job keeps its units busy and go back to automatic while it idles")
+
+    def _ask(self, what):
+        if what == "max":
+            self.pinned = True
+        elif what == "quiet":
+            self.pinned = self.boosted = False
+            self.idle_since = time.time()
+        elif what == "full":
+            self.boosted = True
+        self.jobs.put(what)
+
+    def observe(self, busy, state):
+        now = time.time()
+        if busy is None:
+            self.busy_since = self.idle_since = None
+            if not self.pinned:
+                log("--stable: no busy readings, so the fans are pinned for the rest of the job")
+                self._ask("max")
+        elif busy >= FAN_PIN_BUSY:
+            self.idle_since = None
+            self.busy_since = self.busy_since or now
+            if not self.pinned and now - self.busy_since >= FAN_PIN_AFTER:
+                self._ask("max")
+        elif busy < FAN_IDLE_BUSY:
+            self.busy_since = None
+            self.idle_since = self.idle_since or now
+            if (self.pinned or self.owed) and now - self.idle_since >= FAN_IDLE_AFTER:
+                self._ask("quiet")
+        else:
+            self.busy_since = self.idle_since = None
+        if state > NOMINAL and self.pinned and not self.boosted:
+            self._ask("full")
+
+    def _work(self):
+        while True:
+            what = self.jobs.get()
+            if what is None:
+                return
+            try:
+                if what == "max":
+                    self.owed = True
+                    percent = pinned_percent(run_fans("max"))
+                    self.below_max = percent < 100
+                    log("--stable: the job is busy; fans pinned {}{}".format(
+                        fan_level(percent), ", raised to maximum if the heat leaves nominal" if self.below_max else ""))
+                elif what == "full" and self.below_max:
+                    run_fans("full")
+                    log("--stable: heat left nominal; fans raised to maximum")
+                elif what == "quiet":
+                    if hand_back_fans(keep_hold=True):
+                        self.owed = False
+                        log("--stable: the job is idle; fans back on automatic")
+            except OSError as e:
+                if what == "full":
+                    log("--stable: heat left nominal, but the fans could not be raised to maximum ({}); rerun "
+                        "scripts/install-fan-helper.sh and add the sudoers line it prints".format(e))
+                else:
+                    log("--stable: could not {} the fans: {}".format("pin" if what == "max" else "release", e))
+
+    def stop(self):
+        # Changes still queued when the job ends are stale; release_fans hands back what is owed.
+        while True:
+            try:
+                self.jobs.get_nowait()
+            except queue.Empty:
+                break
+        self.jobs.put(None)
+        self.worker.join()
+
+
+def start_run_fans():
+    global _run_fans
+    if not FAN_CMD:
+        return None
+    if not fan_helper_installed():
+        log("--stable: fans left on automatic; scripts/install-fan-helper.sh would pin them")
+        return None
+    _run_fans = RunFans()
+    return _run_fans
 
 
 def release_fans():
-    global _fans_owed
-    if not _fans_owed:
-        return
-    _fans_owed = False
-    # A boost still running would otherwise take the fans again after auto.
-    if _boost:
-        _boost.join()
-    try:
-        run_fans("auto")
-    except OSError as e:
-        log("--stable: could not return the fans to automatic ({}); run: {} auto".format(e, " ".join(FAN_CMD)))
+    global _run_fans, _fan_hold
+    if _run_fans is not None:
+        # A pin still running would otherwise take the fans again after auto.
+        _run_fans.stop()
+        handed_back = not _run_fans.owed
+        _run_fans = None
+        if handed_back and _fan_hold is not None:
+            os.close(_fan_hold)
+            _fan_hold = None
+    if _fan_hold is not None and hand_back_fans(keep_hold=False) is False:
+        log("--stable: fans stay pinned for another --stable job")
 
 
 def try_lock(slot, shared=False):
@@ -1231,7 +1419,7 @@ def preempt(slots, instruction, handled):
         kill_group(lease["pgid"], signal.SIGKILL)
 
 
-def try_admit(requested, want, held, stable, barriers, override=False, priority=0):
+def try_admit(requested, want, held, stable, barriers, override=False, priority=0, since=None):
     """One attempt. Returns (slot fds, (lease fd, path), shared slots, refusal).
 
     Every refusal leaves through refuse(), so no path can keep a barrier it is no
@@ -1265,15 +1453,22 @@ def try_admit(requested, want, held, stable, barriers, override=False, priority=
             for waiter in read_queue():
                 # Checked before any barrier is raised, so a refusal here drops this job's barriers.
                 # A paused --stable waiter cannot start, so it holds no one back.
-                if not set(waiter.get("needs", ())) & need or (
+                if waiter.get("pid") == os.getpid() or not set(waiter.get("needs", ())) & need or (
                         pause and waiter.get("stable") and not waiter.get("override")):
                     continue
-                if waiter.get("priority", 0) > priority:
-                    return refuse("pid {} has priority {} and goes first".format(
-                        waiter.get("pid"), waiter.get("priority")))
+                if waiter.get("priority", 0) != priority:
+                    if waiter.get("priority", 0) > priority:
+                        return refuse("pid {} has priority {} and goes first".format(
+                            waiter.get("pid"), waiter.get("priority")))
+                    continue
                 # A --stable job would hold every slot alone for its whole run; quick shared work goes first.
-                if stable and not waiter.get("stable") and waiter.get("priority", 0) == priority:
-                    return refuse("pid {} is waiting without --stable and goes first".format(waiter.get("pid")))
+                if bool(waiter.get("stable")) != stable:
+                    if stable:
+                        return refuse("pid {} is waiting without --stable and goes first".format(waiter.get("pid")))
+                    continue
+                if (waiter.get("since", 0), waiter.get("pid", 0)) < (time.time() if since is None else since,
+                                                                       os.getpid()):
+                    return refuse("pid {} has waited longer and goes first".format(waiter.get("pid")))
         used_cpus = sum(lease["cpus"] for lease in leases)
         # A job taking the cpu slot whole is answered by the lock below, never the budget:
         # only a lock refusal raises its barrier, and without one sharers declaring cores
@@ -1361,7 +1556,8 @@ def read_queue():
             continue
         try:
             with open(path) as f:
-                waiters.append(json.load(f))
+                # A rewrite can leave old bytes after the new record for a moment; the record is first.
+                waiters.append(json.JSONDecoder().raw_decode(f.read())[0])
         except (OSError, ValueError):
             pass
     return sorted(waiters, key=lambda w: w.get("since", 0))
@@ -1372,7 +1568,15 @@ def acquire(requested, want, held, max_wait, stable, override=None, queued=None,
     delay = 1.0
     last_key, last_logged = None, 0.0
     barriers, handled = {}, set()
-    entry = None
+    record = dict(queued or {}, pid=os.getpid(), since=start, reason="starting",
+                  needs=sorted((set(SLOTS) if stable else set(requested)) - held), stable=stable,
+                  override=bool(override), priority=priority, ahead=False)
+    # Listed before the first attempt, so a later job that asks while this one is between attempts sees it.
+    try:
+        entry = queue_entry(record)
+    except OSError as e:
+        entry = None
+        log("cannot list this job in the queue ({}); it still waits its turn".format(e))
     try:
         while True:
             if override:
@@ -1386,13 +1590,17 @@ def acquire(requested, want, held, max_wait, stable, override=None, queued=None,
                     sys.exit(EXIT_LOW_BATTERY)
                 state, cooldown, warm_cooldown = read_thermal()
                 reason = hold or too_hot_to_start(state, cooldown, warm_cooldown, stable)
+                if stable and not hold and state > NOMINAL and not stable_pause():
+                    pin_fans_while_waiting()
+                elif _waiter_pinned and (state <= NOMINAL or stable_pause()):
+                    unpin_waiter("the heat is back to nominal" if state <= NOMINAL else "admission is paused")
             if reason is not None:
                 # Held up by heat rather than by a sharer, so nothing is owed a
                 # barrier; try_admit keeps its own.
                 sync_barriers(barriers, set())
             else:
                 fds, lease_fd, share, reason = try_admit(
-                    requested, want, held, stable, barriers, override=bool(override), priority=priority)
+                    requested, want, held, stable, barriers, override=bool(override), priority=priority, since=start)
                 if reason is None:
                     return fds, lease_fd, share, state
             # Reasons carry running counters ("held ... for 668s"), which change every poll.
@@ -1401,10 +1609,7 @@ def acquire(requested, want, held, max_wait, stable, override=None, queued=None,
             if key != last_key:
                 log("waiting: " + reason)
                 last_key, last_logged = key, now
-                record = dict(queued or {}, pid=os.getpid(), since=start, reason=reason,
-                              needs=sorted(set(SLOTS) if stable else set(requested)), stable=stable,
-                              override=bool(override), priority=priority,
-                              ahead=bool(barriers))
+                record.update(reason=reason, ahead=bool(barriers))
                 try:
                     if entry is None:
                         entry = queue_entry(record)
@@ -1628,8 +1833,6 @@ def cmd_run(args):
     env[HELD_ENV] = ",".join(s for s in SLOTS if s in held or s in fds)
     env[HELD_CPUS_ENV] = str(held_cpus + want)
     deadline = time.time() + args.timeout if args.timeout > 0 else None
-    if args.stable:
-        pin_fans()
     # Read before the job starts, so its first instant is in the count.
     residency = TopClockResidency() if args.min_top_clock_residency is not None else None
     # The job inherits the slot locks, so a slot stays taken while the job
@@ -1666,6 +1869,7 @@ def cmd_run(args):
         signal.signal(sig, forward)
 
     watch = ThrottleWatch(needs, args.throttle_budget, args.min_freq_ratio) if args.stable else None
+    fans = start_run_fans() if watch else None
     try:
         while True:
             try:
@@ -1679,9 +1883,9 @@ def cmd_run(args):
                     break
                 # Read every run, so heat caused by any job delays the next --stable one.
                 now_state = read_thermal()[0]
-                if watch and now_state > NOMINAL:
-                    boost_fans()
                 reason = watch.check(now_state) if watch else None
+                if fans:
+                    fans.observe(watch.busy, now_state)
                 if not reason:
                     continue
                 log(
@@ -1821,6 +2025,9 @@ def cmd_status(args):
     ceilings = freq_ceilings()
     if ceilings:
         print("hardware max: " + ", ".join("{} {:.0f} MHz".format(s, ceilings[s]) for s in sorted(ceilings)))
+    now_line = current_frequencies()
+    if now_line:
+        print("frequency now: " + now_line)
     # Read before the lock, as run does: an unreadable lease is charged the whole budget,
     # and working that out may ask sysctl, which nothing should wait on under the lock.
     cpu_budget()
@@ -1841,7 +2048,7 @@ def cmd_status(args):
         except OSError as e:
             print(paint("fans: unknown ({})".format(e), "yellow"))
         else:
-            if pinned and (not leases_known or any(lease.get("stable") for lease in leases)):
+            if pinned and fans_held():
                 print("fans: pinned {}".format(fan_level(live_percent(report))))
             elif pinned:
                 # Only a wrapper killed outright skips handing them back.
@@ -1880,15 +2087,11 @@ def cmd_status(args):
             jobs.setdefault(lease.get("child_pid") or lease["path"], lease)
 
     now = time.time()
-    waiters = sorted(read_queue(), key=lambda w: (-w.get("priority", 0), bool(w.get("stable"))))
+    waiters = sorted(read_queue(), key=lambda w: (-w.get("priority", 0), bool(w.get("stable")), w.get("since", 0)))
     if waiters:
         print()
-        # Waiters retry every second or two and whichever asks first once a slot frees gets it,
-        # so arrival is all that can be shown; only a priority, --stable or a barrier changes who goes first.
-        print("queue: {} waiting{}".format(len(waiters), ", by priority, then jobs without --stable, then arrival;"
-                                           " within that there is no"
-                                           " fixed order: whoever asks first once a slot frees gets it, except that"
-                                           " new sharers hold back for a job waiting for a whole slot"
+        print("queue: {} waiting{}".format(len(waiters), ", in the order they start among jobs needing the same"
+                                           " slot: by priority, then jobs without --stable, then earliest arrival"
                                            if len(waiters) > 1 else ""))
         for waiter in waiters:
             bits = [paint("--user-override", "red")] if waiter.get("override") else []

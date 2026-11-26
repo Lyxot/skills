@@ -32,7 +32,7 @@ hwgate run --needs cpu --cpus 4 --max-wait 300 -- python -m pytest -n 4 tests/
 
 ## Benchmarks: `--stable`
 
-`--stable` takes every slot, starts only after 120s at nominal heat, and pins the fans: at maximum, or at a lower set level (see the fan setup below) that goes to maximum for the rest of the job once the heat leaves nominal. It exits 76 if it is throttled (heat plus a frequency drop) longer than `--throttle-budget` (default 10s). On success it prints a `--stable run:` frequency summary; quote it next to the numbers.
+`--stable` takes every slot, starts only after 120s at nominal heat, and pins the fans while there is real load: once a unit it needs stays at least 50% busy (machine-wide) for 2s, at maximum or at a lower set level (see the fan setup below) that goes to maximum once the heat leaves nominal. After 20s below 20% busy, and when it exits, it puts them back on automatic unless another job holds them, even when the pin was left by a job that has gone; loading and teardown stay quiet. Without busy readings it pins them for the whole job. While it waits for nominal heat it pins them at the set level when no other job holds them, and hands them back once the heat is nominal; whichever job lets go last hands them back. It exits 76 if it is throttled (heat plus a frequency drop) longer than `--throttle-budget` (default 10s). On success it prints a `--stable run:` frequency summary; quote it next to the numbers.
 
 Give each case or A/B pair its own run, looping outside `hwgate`, so each starts cool and an abort costs one case. Inside a pair, alternate ABAB in one process.
 
@@ -55,11 +55,11 @@ The fans need a one-time setup by the user (agents can't sudo): `sudo sh <skill 
 
 ## Priority
 
-`--priority N` (default 0) lets a job go first: while it waits for a slot, jobs with a lower priority that need that slot do not start, and none raises a barrier against it. At equal priority, a waiting job without `--stable` goes before a `--stable` one, which would hold the whole machine for its run. Otherwise equal priorities keep the usual order, and running jobs are never stopped. Set it only when the user asks for a job to go first; everyone else leaves it at 0, or priorities stop meaning anything.
+`--priority N` (default 0) lets a job go first: while it waits for a slot, jobs with a lower priority that need that slot do not start, and none raises a barrier against it. At equal priority, a waiting job without `--stable` goes before a `--stable` one, which would hold the whole machine for its run. Otherwise the job that has waited longest goes first, even when a later one would fit now (a later job without `--stable` still goes before an earlier `--stable` one), and running jobs are never stopped. Set it only when the user asks for a job to go first; everyone else leaves it at 0, or priorities stop meaning anything.
 
 ## Pausing `--stable`
 
-`hwgate pause-stable [--reason TEXT]` keeps new `--stable` jobs waiting (they wait as for heat, and exit 75 at `--max-wait`) until `hwgate resume-stable`. Running jobs, jobs without `--stable` and `--user-override` are unaffected; `hwgate status` shows the pause. Both are the user's commands: run them only when the user asks.
+`hwgate pause-stable [--reason TEXT]` keeps new `--stable` jobs waiting (they wait as for heat, and exit 75 at `--max-wait`) until `hwgate resume-stable`; a waiting job hands back fans it pinned while it waited. Running jobs, jobs without `--stable` and `--user-override` are unaffected; `hwgate status` shows the pause. Both are the user's commands: run them only when the user asks.
 
 ## User override
 
@@ -73,7 +73,7 @@ It kills every job holding a slot this job needs (they exit 78) and starts at on
 
 ## Status and exit codes
 
-`hwgate status` shows heat, battery, budget, each slot and its jobs, the jobs waiting to start (by priority, then jobs without `--stable`, then arrival; new sharers hold back for a job waiting for a whole slot, which is marked), and each running job with its pid and command (`--full` for whole commands). `hwgate:` lines on stderr say why a job waits.
+`hwgate status` shows heat, battery, each unit's current frequency and how busy it is, budget, each slot and its jobs, the jobs waiting to start (in the order they start: by priority, then jobs without `--stable`, then earliest arrival; new sharers hold back for a job waiting for a whole slot, which is marked), and each running job with its pid and command (`--full` for whole commands). `hwgate:` lines on stderr say why a job waits.
 
 | Code | Meaning | What to do |
 |---|---|---|
@@ -93,6 +93,6 @@ It kills every job holding a slot this job needs (they exit 78) and starts at on
 - Never raise `--priority` unless the user asked for that job to go first.
 - Never run `pause-stable` or `resume-stable` unless the user asked.
 - Never under-declare `--cpus`.
-- Never set `HWGATE_FORCE_*`, `HWGATE_STATE_DIR` or `HWGATE_TOP_CLOCK_MIN_ACTIVE` outside hwgate's own tests.
+- Never set `HWGATE_FORCE_*`, `HWGATE_STATE_DIR`, `HWGATE_FAN_IDLE_AFTER` or `HWGATE_TOP_CLOCK_MIN_ACTIVE` outside hwgate's own tests.
 - Don't wrap commands that leave a background process behind: it is killed when the job returns.
 - Kill only your own job, by its pid from `hwgate status`. Don't delete lock files.
